@@ -1,6 +1,6 @@
-# IPSA Status — Phase 3 (Google Ads write path)
+# IPSA Status — Phase 4 (Tests + verification)
 
-Last updated after Phase 3 of the salvage plan. This document replaces the
+Last updated after Phase 4 of the salvage plan. This document replaces the
 eight conflicting "COMPLETE" declarations in `docs/archive/`. If anything
 in this file disagrees with code, the code is the source of truth — file
 an issue and update this doc.
@@ -59,6 +59,12 @@ an issue and update this doc.
   stored in `details`, HTTP `502`.
 - **MMM insights** — rule-based channel summaries, saturation curves, and
   optimal allocations via `mmm_insights.MMMInsightsEngine`.
+- **The spine is now covered by an end-to-end test.**
+  `tests/test_e2e_spine.py` runs three real optimization cycles against an
+  in-memory DB and asserts `allocation_changes` rows exist, each with a
+  real integer arm FK and a generated `explanation`, then reads the latest
+  decision back through the API. `tests/test_api_smoke.py` GETs every route
+  and asserts no 5xx. Full suite: `pytest -q` → **65 passed, 4 skipped**.
 
 ## Works only in simulation
 
@@ -102,10 +108,28 @@ Now living in `src/bandit_ads/_archive/`:
   before any public deploy.
 - **No authentication.** `auth.py` exists; it is not enforced on the
   routers.
-- **`pytest` is not yet pinned in `requirements.txt`** — added in Phase 4.
 
 ## Recently changed
 
+- **Phase 4:** added the test harness and let it find the bugs the earlier
+  "COMPLETE" docs hid.
+  - Pinned `pytest` / `pytest-asyncio` / `httpx` in `requirements.txt`;
+    added `pytest.ini` (`asyncio_mode = auto`, `testpaths = tests`).
+  - `tests/test_e2e_spine.py` (the canary) and `tests/test_api_smoke.py`
+    (no-5xx GET smoke over 33 routes). The two PDF tests now
+    `importorskip("fpdf")`.
+  - **Fixed `_arm_key_to_db_id`:** it resolved arms via detached ORM
+    instances, raising `DetachedInstanceError` (swallowed by
+    `_handle_allocation_changes`) so `allocation_changes` never got a row.
+    Now reads arm primitives inside an active session. The Phase 1
+    "linchpin fix" was real but had never actually run end-to-end — the
+    canary is what proved it.
+  - **Set `expire_on_commit=False`** on the sessionmaker. The codebase
+    routinely returns ORM rows out of `with get_session()` blocks and reads
+    them afterward; the default expire-on-commit broke ~6 campaign GET
+    routes with `Instance ... is not bound to a Session`.
+  - **Fixed `/api/campaigns/{id}/time-series`** to handle SQLite's `date()`
+    text result (was calling `.isoformat()` on a `str`).
 - **Phase 3:** wired the Google Ads write path behind the existing
   feature flags.
   - `api/routes/recommendations.py::approve_recommendation` now parses

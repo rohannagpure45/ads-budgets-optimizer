@@ -221,8 +221,10 @@ async def get_performance_time_series(
             result = []
             for row in daily_metrics:
                 roas = row.revenue / row.cost if row.cost > 0 else 0.0
+                # SQLite's date() returns a text string; Postgres returns a date.
+                row_date = row.date.isoformat() if hasattr(row.date, "isoformat") else str(row.date)
                 result.append({
-                    "date": row.date.isoformat(),
+                    "date": row_date,
                     "impressions": int(row.impressions or 0),
                     "clicks": int(row.clicks or 0),
                     "conversions": int(row.conversions or 0),

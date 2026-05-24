@@ -91,16 +91,42 @@ Drive-bys done while we were in the area:
    (no creds required) and an end-to-end round-trip that asserts
    `amount_micros == 50_000_000` after a $50 mutation.
 
-## Phase 4 — Tests + verification
+## Phase 4 — Tests + verification ✅
 
-1. Pin `pytest`, `pytest-asyncio`, `httpx` in `requirements.txt`; add
-   `pytest.ini` with `asyncio_mode = auto`.
-2. Prune dead tests; mark unstable ones with `pytest.mark.skip` + TODO.
-3. **`tests/test_e2e_spine.py`** — the canary. In-memory SQLite,
-   3 cycles of `_run_optimization_cycle()`, assert
-   `allocation_changes` is non-empty and every row has a non-null
-   `explanation`. If this passes, the salvage is real.
-4. `tests/test_api_smoke.py` — smoke every router.
+1. **Test deps pinned + `pytest.ini`.** `pytest`, `pytest-asyncio`, and
+   `httpx` added to `requirements.txt` (pinned to the versions verified in
+   this environment: 9.0.3 / 1.3.0 / 0.28.1). `pytest.ini` sets
+   `asyncio_mode = auto` and `testpaths = tests`.
+2. **Unstable tests marked.** The two PDF-export tests now
+   `pytest.importorskip("fpdf")` — they skip cleanly when the optional
+   `fpdf` dep is absent and run when it's present (TODO: pin `fpdf2`).
+3. **`tests/test_e2e_spine.py`** — the canary. In-memory SQLite, one
+   campaign + 3 arms, 3× `_run_optimization_cycle()`, asserts
+   `allocation_changes` is non-empty, every row has a real integer arm FK
+   and a non-null `explanation`, then `GET /api/campaigns/{id}/latest_decision`
+   returns 200 with that explanation.
+4. **`tests/test_api_smoke.py`** — enumerates every GET route from the app
+   and asserts no 5xx. 33 routes covered (PDF route skipped when `fpdf`
+   absent).
+
+Two real wiring bugs the new tests surfaced and fixed (the canary's whole
+reason to exist):
+- **`_arm_key_to_db_id` resolved arms via detached ORM instances.**
+  `get_arms_by_campaign` returns rows from a closed session; with the
+  default `expire_on_commit=True` every attribute access raised
+  `DetachedInstanceError`, which `_handle_allocation_changes`' broad
+  `except` swallowed — so `allocation_changes` stayed empty no matter how
+  many cycles ran. Now reads arm primitives inside an active session.
+- **`expire_on_commit=False` on the sessionmaker.** The same detached-read
+  pattern broke ~6 GET routes (`/api/campaigns/{id}`, `/arms`,
+  `/settings`, …) with `Instance ... is not bound to a Session`. Disabling
+  expire-on-commit fixes the whole class at the root.
+- Drive-by: `/api/campaigns/{id}/time-series` called `.isoformat()` on
+  SQLite's `date()` text result; now tolerates str (SQLite) and date
+  (Postgres).
+
+Result: `pytest -q` → **65 passed, 4 skipped** (2 Google Ads sandbox
+without creds, 2 PDF without `fpdf`).
 
 ## Phase 5 — STATUS.md
 

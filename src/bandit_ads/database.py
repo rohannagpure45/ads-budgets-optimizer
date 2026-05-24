@@ -317,7 +317,14 @@ class DatabaseManager:
                 echo=False
             )
         
-        self.SessionLocal = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
+        # expire_on_commit=False so ORM instances keep their loaded attribute
+        # values after the session commits/closes. The codebase routinely returns
+        # objects out of `with get_session()` blocks and reads them afterwards;
+        # the default (expire-on-commit) makes every such access raise
+        # DetachedInstanceError.
+        self.SessionLocal = sessionmaker(
+            bind=self.engine, autocommit=False, autoflush=False, expire_on_commit=False
+        )
         logger.info(f"Database initialized: {database_url}")
     
     def create_tables(self):

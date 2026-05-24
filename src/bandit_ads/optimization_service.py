@@ -704,33 +704,61 @@ class ContinuousOptimizationService:
         if arm_key in cache:
             return cache[arm_key]
 
-        arms_db = get_arms_by_campaign(campaign_id)
-        for arm_db in arms_db:
-            if str(arm_db) == arm_key:
-                cache[arm_key] = arm_db.id
-                return arm_db.id
+        # Reduce the arm rows to plain primitives *inside* an active session.
+        # The default sessionmaker uses expire_on_commit=True, so detached ORM
+        # instances raise DetachedInstanceError on attribute access — which the
+        # broad except in _handle_allocation_changes would silently swallow,
+        # leaving allocation_changes empty (the original documentation-theater bug).
+        from src.bandit_ads.database import Arm
+        db_manager = get_db_manager()
+        with db_manager.get_session() as session:
+            arm_rows = [
+                {
+                    'id': a.id,
+                    'platform': a.platform,
+                    'channel': a.channel,
+                    'creative': a.creative,
+                    'bid': float(a.bid),
+                }
+                for a in session.query(Arm).filter(Arm.campaign_id == campaign_id).all()
+            ]
 
-        # Also try matching on the agent's arms — the agent's __str__ may
-        # differ from Arm.__repr__. Walk the runner's arms to find a parity.
+        # 1) Direct match: rebuild the agent-style key (Arm.__repr__ without the
+        #    DB id) from each row and compare against str(agent_arm).
+        for row in arm_rows:
+            agent_style_key = (
+                f"Arm(platform={row['platform']}, channel={row['channel']}, "
+                f"creative={row['creative']}, bid={row['bid']})"
+            )
+            if agent_style_key == arm_key:
+                cache[arm_key] = row['id']
+                return row['id']
+
+        # 2) Structured fallback via the runner's agent arms — handles int/float
+        #    bid formatting drift between the config and the DB Float column.
         runner = self.campaign_runners.get(campaign_id)
         if runner is not None:
             for agent_arm in runner.agent.arms:
                 if str(agent_arm) != arm_key:
                     continue
-                # Match on the (platform, channel, creative, bid) tuple
-                for arm_db in arms_db:
+                for row in arm_rows:
                     if (
-                        arm_db.platform == getattr(agent_arm, 'platform', None)
-                        and arm_db.channel == getattr(agent_arm, 'channel', None)
-                        and arm_db.creative == getattr(agent_arm, 'creative', None)
-                        and float(arm_db.bid) == float(getattr(agent_arm, 'bid', 0))
+                        row['platform'] == getattr(agent_arm, 'platform', None)
+                        and row['channel'] == getattr(agent_arm, 'channel', None)
+                        and row['creative'] == getattr(agent_arm, 'creative', None)
+                        and row['bid'] == float(getattr(agent_arm, 'bid', 0))
                     ):
-                        cache[arm_key] = arm_db.id
-                        return arm_db.id
+                        cache[arm_key] = row['id']
+                        return row['id']
 
+        available = [
+            f"Arm(platform={r['platform']}, channel={r['channel']}, "
+            f"creative={r['creative']}, bid={r['bid']})"
+            for r in arm_rows
+        ]
         logger.error(
             f"Cannot resolve arm_key {arm_key!r} to a DB Arm.id for campaign {campaign_id}. "
-            f"Available arms: {[str(a) for a in arms_db]}"
+            f"Available arms: {available}"
         )
         return None
 
