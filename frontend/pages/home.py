@@ -98,18 +98,19 @@ def render(greeting: str):
         )
 
     # ── Demo banner ──────────────────────────────────────────────────────────
-    if data_service.use_mock and not st.session_state.get("demo_banner_dismissed", False):
+    # Surfaces the onboarding flow when the backend API isn't reachable.
+    if not data_service.health() and not st.session_state.get("demo_banner_dismissed", False):
         bc, btc, cc = st.columns([6, 2, 1])
         with bc:
             st.markdown(
                 "<div style='padding:8px 0;'>"
-                "<span style='font-size:0.9rem; font-weight:600; color:#9b4819;'>🎬 Demo mode</span>"
+                "<span style='font-size:0.9rem; font-weight:600; color:#9b4819;'>⚠ Backend unavailable</span>"
                 "<span style='font-size:0.85rem; color:#6B7280; margin-left:8px;'>"
-                "No live campaigns — explore a sample dataset.</span></div>",
+                "API is unreachable — start the backend or walk through onboarding with sample data.</span></div>",
                 unsafe_allow_html=True,
             )
         with btc:
-            if st.button("▶ Run Demo", key="home_run_demo", type="primary", use_container_width=True):
+            if st.button("▶ Onboarding", key="home_run_demo", type="primary", use_container_width=True):
                 st.session_state.current_page = "onboarding"
                 st.session_state.onboarding_step = 1
                 st.rerun()

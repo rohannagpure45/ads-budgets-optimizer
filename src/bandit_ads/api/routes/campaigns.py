@@ -9,6 +9,7 @@ from sqlalchemy import func, and_, desc
 import json
 from pydantic import BaseModel
 
+from src.bandit_ads.change_tracker import AllocationChange
 from src.bandit_ads.database import get_db_manager, Campaign, Arm, Metric, AgentState
 from src.bandit_ads.db_helpers import (
     get_campaign, get_campaign_by_name, get_arms_by_campaign,
@@ -220,8 +221,10 @@ async def get_performance_time_series(
             result = []
             for row in daily_metrics:
                 roas = row.revenue / row.cost if row.cost > 0 else 0.0
+                # SQLite's date() returns a text string; Postgres returns a date.
+                row_date = row.date.isoformat() if hasattr(row.date, "isoformat") else str(row.date)
                 result.append({
-                    "date": row.date.isoformat(),
+                    "date": row_date,
                     "impressions": int(row.impressions or 0),
                     "clicks": int(row.clicks or 0),
                     "conversions": int(row.conversions or 0),
@@ -653,57 +656,166 @@ async def update_campaign_settings(
 
 @router.get("/{campaign_id}/allocation")
 async def get_campaign_allocation(campaign_id: int):
-    """Get current allocation for campaign."""
+    """Get current allocation for campaign with 7-day spend-share delta."""
     try:
         campaign = get_campaign(campaign_id)
         if not campaign:
             raise HTTPException(status_code=404, detail="Campaign not found")
-        
-        arms = get_arms_by_campaign(campaign_id)
-        
+
+        now = datetime.utcnow()
+        window_recent_start = now - timedelta(days=7)
+        window_prev_start = now - timedelta(days=14)
+
         db_manager = get_db_manager()
         with db_manager.get_session() as session:
+            arms = session.query(Arm).filter(Arm.campaign_id == campaign_id).all()
+            # Single aggregate query for total campaign spend
+            total_campaign_spend = (
+                session.query(func.sum(Metric.cost))
+                .filter(Metric.campaign_id == campaign_id)
+                .scalar() or 0.0
+            )
+
+            # Spend per arm over the last 7 days and the prior 7 days
+            recent_spend = dict(
+                session.query(Metric.arm_id, func.sum(Metric.cost))
+                .filter(
+                    and_(
+                        Metric.campaign_id == campaign_id,
+                        Metric.timestamp >= window_recent_start,
+                        Metric.timestamp <= now,
+                    )
+                )
+                .group_by(Metric.arm_id)
+                .all()
+            )
+            prev_spend = dict(
+                session.query(Metric.arm_id, func.sum(Metric.cost))
+                .filter(
+                    and_(
+                        Metric.campaign_id == campaign_id,
+                        Metric.timestamp >= window_prev_start,
+                        Metric.timestamp < window_recent_start,
+                    )
+                )
+                .group_by(Metric.arm_id)
+                .all()
+            )
+
+            recent_total = sum(recent_spend.values()) or 0.0
+            prev_total = sum(prev_spend.values()) or 0.0
+
             result = []
             for arm in arms:
-                # Get metrics for this arm
-                metrics = session.query(Metric).filter(
-                    Metric.arm_id == arm.id
-                ).all()
-                
+                metrics = session.query(Metric).filter(Metric.arm_id == arm.id).all()
                 total_spend = sum(m.cost for m in metrics)
                 total_revenue = sum(m.revenue for m in metrics)
-                
-                # Get agent state for allocation
-                agent_state = session.query(AgentState).filter(
-                    and_(
-                        AgentState.campaign_id == campaign_id,
-                        AgentState.arm_id == arm.id
-                    )
-                ).first()
-                
-                # Calculate allocation percentage (based on spend or agent state)
-                total_campaign_spend = sum(m.cost for m in session.query(Metric).filter(
-                    Metric.campaign_id == campaign_id
-                ).all())
-                
-                allocation = (total_spend / total_campaign_spend * 100) if total_campaign_spend > 0 else 0
-                
+
+                allocation = (
+                    total_spend / total_campaign_spend if total_campaign_spend > 0 else 0.0
+                )
+
+                # 7-day spend-share delta vs. the prior 7-day window
+                recent_share = (
+                    (recent_spend.get(arm.id, 0.0) / recent_total)
+                    if recent_total > 0 else 0.0
+                )
+                prev_share = (
+                    (prev_spend.get(arm.id, 0.0) / prev_total)
+                    if prev_total > 0 else 0.0
+                )
+                change_pct_points = round((recent_share - prev_share) * 100, 2)
+
                 result.append({
                     "id": arm.id,
                     "name": f"{arm.platform} - {arm.channel} - {arm.creative}",
                     "platform": arm.platform,
                     "channel": arm.channel,
                     "creative": arm.creative,
-                    "allocation": allocation / 100,  # As decimal
+                    "allocation": allocation,
                     "spend": total_spend,
                     "revenue": total_revenue,
                     "roas": total_revenue / total_spend if total_spend > 0 else 0.0,
-                    "change": 0.0  # TODO: Calculate change from previous period
+                    "change": change_pct_points,
                 })
-            
+
             return result
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting allocation for campaign {campaign_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{campaign_id}/latest_decision")
+async def get_campaign_latest_decision(campaign_id: int):
+    """Most recent AllocationChange row for this campaign, with explanation."""
+    try:
+        campaign = get_campaign(campaign_id)
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        db_manager = get_db_manager()
+        with db_manager.get_session() as session:
+            change = (
+                session.query(AllocationChange)
+                .filter(AllocationChange.campaign_id == campaign_id)
+                .order_by(AllocationChange.timestamp.desc())
+                .first()
+            )
+            if not change:
+                return {
+                    "campaign_id": campaign_id,
+                    "change": None,
+                    "explanation": None,
+                    "timestamp": None,
+                    "message": "No allocation changes recorded yet for this campaign.",
+                }
+
+            return {
+                "campaign_id": campaign_id,
+                "change": {
+                    "id": change.id,
+                    "arm_id": change.arm_id,
+                    "old_allocation": change.old_allocation,
+                    "new_allocation": change.new_allocation,
+                    "change_percent": change.change_percent,
+                    "change_type": change.change_type,
+                    "change_reason": change.change_reason,
+                    "factors": change.factors or {},
+                    "mmm_factors": change.mmm_factors or {},
+                },
+                "explanation": change.explanation,
+                "timestamp": change.timestamp.isoformat() if change.timestamp else None,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting latest_decision for campaign {campaign_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{campaign_id}/pause")
+async def pause_campaign(campaign_id: int):
+    """Pause a campaign via the running optimization service."""
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service.pause_campaign(campaign_id)
+        return {"success": True, "campaign_id": campaign_id, "status": "paused"}
+    except Exception as e:
+        logger.error(f"Error pausing campaign {campaign_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{campaign_id}/resume")
+async def resume_campaign(campaign_id: int):
+    """Resume a campaign via the running optimization service."""
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service.resume_campaign(campaign_id)
+        return {"success": True, "campaign_id": campaign_id, "status": "active"}
+    except Exception as e:
+        logger.error(f"Error resuming campaign {campaign_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

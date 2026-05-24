@@ -13,9 +13,6 @@ class ThompsonSamplingAgent:
     ------------------
     Current implementation uses Beta distributions for Thompson Sampling, which provides
     a lightweight Bayesian approach suitable for real-time optimization.
-
-    Bayesian MMM integration is implemented via the Meridian pipeline; see
-    meridian_bridge.py for posterior-to-Beta prior conversion.
     """
 
     def __init__(self, arms, total_budget, min_allocation=0.01, risk_tolerance=0.3, variance_limit=0.1):
@@ -36,7 +33,6 @@ class ThompsonSamplingAgent:
         self.variance_limit = variance_limit
 
         # Beta distribution parameters for each arm (alpha=successes+1, beta=failures+1)
-        # Informative priors can be set from Meridian posteriors; see meridian_bridge.py
         self.alpha = defaultdict(lambda: 1.0)  # successes (good ROAS outcomes)
         self.beta = defaultdict(lambda: 1.0)   # failures (poor ROAS outcomes)
 
@@ -286,9 +282,6 @@ class IncrementalityAwareBandit(ThompsonSamplingAgent):
     2. Compare observed ROAS to incremental ROAS
     3. Adjust alpha/beta priors based on the gap
     4. Reallocate budget to arms with higher incremental value
-    
-    Bayesian integration: Meridian posteriors feed into incorporate_meridian_posteriors()
-    to set calibrated alpha/beta priors. See meridian_bridge.py for the conversion logic.
     """
     
     def __init__(self, arms, total_budget, holdout_percentage=0.10, **kwargs):
@@ -355,9 +348,6 @@ class IncrementalityAwareBandit(ThompsonSamplingAgent):
                 - observed_roas: Attributed/observed ROAS
                 - is_significant: Whether results are statistically significant
                 - confidence_interval: (lower, upper) CI bounds
-        
-        Bayesian integration: see meridian_bridge.py for posterior → Beta prior conversion,
-        and incorporate_meridian_posteriors() for the update flow.
         """
         if not experiment_result.get('is_significant', False):
             # Don't update priors if results aren't significant
@@ -579,36 +569,6 @@ class IncrementalityAwareBandit(ThompsonSamplingAgent):
         from datetime import datetime
         return datetime.now().isoformat()
     
-    def incorporate_meridian_posteriors(
-        self, campaign_id=None
-    ):
-        """
-        Update arm priors using Meridian posterior distributions.
-
-        Loads a trained Meridian model, converts its media-coefficient posteriors
-        to Beta(alpha, beta) via sigmoid + method-of-moments, and overwrites the
-        current priors.  Forces a budget reallocation afterwards.
-
-        Returns the number of arms updated.
-        """
-        try:
-            from src.bandit_ads.meridian_bridge import update_bandit_from_meridian
-            updated = update_bandit_from_meridian(self, campaign_id=campaign_id)
-            if updated > 0:
-                self.adjustment_history.append({
-                    'direction': 'meridian_update',
-                    'reason': 'meridian_posteriors_applied',
-                    'arms_updated': updated,
-                    'timestamp': self._get_timestamp(),
-                })
-            return updated
-        except Exception as exc:
-            from src.bandit_ads.utils import get_logger
-            get_logger('agent').warning(
-                f"Could not apply Meridian posteriors: {exc}"
-            )
-            return 0
-
     def get_performance_metrics(self):
         """
         Override to include incrementality metrics.

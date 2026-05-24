@@ -90,6 +90,7 @@ class ExplanationGenerator:
             
             # Extract data
             change_data = {
+                "campaign_id": change.campaign_id,
                 "arm_id": change.arm_id,
                 "old_allocation": change.old_allocation,
                 "new_allocation": change.new_allocation,
@@ -120,17 +121,43 @@ class ExplanationGenerator:
         
         # Generate explanation using LLM
         if self.claude_client:
-            return await self._generate_llm_explanation(
+            explanation = await self._generate_llm_explanation(
                 explanation_type="allocation_change",
                 data=change_data,
                 historical_context=historical_context
             )
         else:
-            return self._generate_template_explanation(
+            explanation = self._generate_template_explanation(
                 explanation_type="allocation_change",
                 data=change_data
             )
-    
+
+        # Index the explanation so the RAG loop can surface it later.
+        self._index_decision(change_data, explanation)
+        return explanation
+
+    def _index_decision(self, change_data: Dict[str, Any], explanation: str) -> None:
+        """Store an allocation-change explanation in the vector store.
+
+        Best-effort: indexing degrades to a no-op when the vector store is
+        unavailable, and a failure here must never break explanation
+        generation. This is the one legitimate boundary for a broad except —
+        ChromaDB is an optional external dependency.
+        """
+        if self.vector_store is None:
+            return
+        try:
+            self.vector_store.add_decision_explanation(
+                campaign_id=change_data["campaign_id"],
+                arm_id=change_data["arm_id"],
+                change_type=change_data.get("change_type", "allocation_change"),
+                explanation=explanation,
+                factors=change_data.get("factors", {}),
+                timestamp=None
+            )
+        except Exception as e:
+            logger.warning(f"Failed to index decision explanation: {e}")
+
     async def explain_performance(
         self,
         campaign_id: int,

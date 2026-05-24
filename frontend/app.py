@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 # Import pages after config
-from pages import home, campaigns, campaign_detail, optimizer, ask, recommendations, onboarding, incrementality, data_sources, planning, mmm_insights, meridian_model
+from pages import home, campaigns, campaign_detail, optimizer, ask, recommendations, onboarding, incrementality, data_sources, planning, mmm_insights
 from frontend.components.chat_widget import render_chat_widget
 
 # Custom CSS for IPSA brand styling
@@ -617,7 +617,6 @@ def render_sidebar():
             "✓ Actions": "recommendations",
             "📈 Planning": "planning",
             "🧮 MMM Insights": "mmm_insights",
-            "🔬 Meridian Model": "meridian_model",
             "📊 Campaigns": "campaigns",
             "🧪 Incrementality": "incrementality",
             "💬 Ask": "ask",
@@ -627,10 +626,11 @@ def render_sidebar():
         if "current_page" not in st.session_state:
             st.session_state.current_page = "home"
 
-        # Demo entry — only shown when running on mock/sample data
+        # Demo entry — surfaced when the API is unreachable so users can
+        # still walk through the onboarding flow with seed data.
         from frontend.services.data_service import DataService as _DS
         _demo_svc = _DS()
-        if _demo_svc.use_mock:
+        if not _demo_svc.health():
             if st.button(
                 "🎬 Demo",
                 key="nav_demo",
@@ -742,8 +742,6 @@ def main():
         planning.render()
     elif current_page == "mmm_insights":
         mmm_insights.render()
-    elif current_page == "meridian_model":
-        meridian_model.render()
     elif current_page == "campaigns":
         campaigns.render()
     elif current_page == "campaign_detail":

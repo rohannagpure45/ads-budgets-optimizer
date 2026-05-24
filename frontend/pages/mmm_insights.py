@@ -66,7 +66,6 @@ def render():
         total_spend = cross.get("total_spend", 0)
         total_revenue = cross.get("total_revenue", 0)
         blended_roas = cross.get("blended_roas", 0)
-        model_source = cross.get("model_source", "rule_based")
 
         saturation = data_service.get_mmm_saturation_curves(days=days)
         recs = data_service.get_mmm_budget_recommendations(
@@ -78,20 +77,12 @@ def render():
         return
 
     # Model status indicator
-    if model_source == "meridian":
-        st.markdown(
-            '<div style="display:inline-block; padding:4px 12px; background:#ECFDF5; '
-            'border:1px solid #6EE7B7; border-radius:16px; font-size:0.75rem; '
-            'color:#065F46; font-weight:600;">Meridian (Bayesian)</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div style="display:inline-block; padding:4px 12px; background:#FEF3C7; '
-            'border:1px solid #FCD34D; border-radius:16px; font-size:0.75rem; '
-            'color:#92400E; font-weight:600;">Rule-Based Model</div>',
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        '<div style="display:inline-block; padding:4px 12px; background:#FEF3C7; '
+        'border:1px solid #FCD34D; border-radius:16px; font-size:0.75rem; '
+        'color:#92400E; font-weight:600;">Rule-Based Model</div>',
+        unsafe_allow_html=True,
+    )
 
     # -----------------------------------------------------------------------
     # Section 1 — Portfolio KPIs

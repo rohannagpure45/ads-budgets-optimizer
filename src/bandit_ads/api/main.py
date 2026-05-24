@@ -4,6 +4,7 @@ FastAPI application for Ads Budget Optimizer API.
 Provides REST endpoints for the frontend dashboard.
 """
 
+import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -50,6 +51,43 @@ app.include_router(scenarios.router, prefix="/api/scenarios", tags=["scenarios"]
 app.include_router(export.router, prefix="/api/export", tags=["export"])
 app.include_router(attribution.router, prefix="/api/attribution", tags=["attribution"])
 app.include_router(mmm.router, prefix="/api/mmm", tags=["mmm"])
+
+
+def _optimizer_enabled() -> bool:
+    """Whether to spin up the continuous optimizer on API boot.
+
+    Default off so the test suite and ad-hoc API runs don't start a
+    background loop that writes to the production DB. Flip via
+    IPSA_OPTIMIZER_ENABLED=1.
+    """
+    return os.getenv("IPSA_OPTIMIZER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+
+
+@app.on_event("startup")
+async def _startup_optimizer():
+    if not _optimizer_enabled():
+        logger.info("Optimizer not enabled on startup (set IPSA_OPTIMIZER_ENABLED=1 to enable)")
+        return
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service.start()
+        logger.info("Continuous optimization service started via API startup hook")
+    except Exception as e:
+        logger.error(f"Failed to start optimization service: {e}", exc_info=True)
+
+
+@app.on_event("shutdown")
+async def _shutdown_optimizer():
+    if not _optimizer_enabled():
+        return
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service.stop()
+        logger.info("Continuous optimization service stopped via API shutdown hook")
+    except Exception as e:
+        logger.error(f"Error stopping optimization service: {e}", exc_info=True)
 
 
 @app.get("/")

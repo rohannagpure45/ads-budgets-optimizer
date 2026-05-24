@@ -30,9 +30,8 @@ class ETLPipeline:
     coefficients. Uses Ridge Regression for coefficient estimation with
     rule-based MMM feature calculation.
 
-    Bayesian model training is triggered via _trigger_meridian_training() at the
-    end of each ETL run. See meridian_trainer.py for the training pipeline and
-    meridian_data.py for data preparation.
+    Aggregated metrics feed the rule-based MMM coefficients used by the
+    optimization runner; Meridian-based training has been archived.
     """
     
     def __init__(self, lookback_days: int = 30):
@@ -355,9 +354,6 @@ class ETLPipeline:
                 'mmm_features': transformed['mmm_features']
             }
 
-            # Trigger Meridian re-training if configured and data sufficient
-            result['meridian_training'] = self._trigger_meridian_training(campaign_id)
-
             logger.info(f"ETL pipeline completed successfully for campaign {campaign_id}")
             return result
             
@@ -399,28 +395,3 @@ class ETLPipeline:
         
         logger.info(f"ETL completed for {results['campaigns_processed']} campaigns")
         return results
-
-    def _trigger_meridian_training(self, campaign_id: int) -> dict:
-        """
-        Attempt to train/retrain a Meridian model after new ETL data lands.
-
-        Returns a status dict; never raises.
-        """
-        try:
-            from src.bandit_ads.utils import ConfigManager
-            cm = ConfigManager()
-            engine = cm.get("mmm.engine", "rule_based")
-            if engine != "meridian":
-                return {"triggered": False, "reason": "mmm.engine is not meridian"}
-
-            from src.bandit_ads.meridian_trainer import MeridianTrainer
-            trainer = MeridianTrainer()
-            result = trainer.train(campaign_id=campaign_id)
-            return {
-                "triggered": True,
-                "success": result.success,
-                "error": result.error,
-            }
-        except Exception as exc:
-            logger.debug(f"Meridian training skipped: {exc}")
-            return {"triggered": False, "reason": str(exc)}

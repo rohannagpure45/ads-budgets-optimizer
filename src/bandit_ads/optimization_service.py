@@ -5,7 +5,9 @@ Long-running service that continuously optimizes advertising campaigns.
 Runs optimization cycles, maintains state, and handles multiple campaigns.
 """
 
+import asyncio
 import json
+import threading
 import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
@@ -15,7 +17,7 @@ from enum import Enum
 from src.bandit_ads.runner import AdOptimizationRunner, create_sample_campaign_config
 from src.bandit_ads.database import get_db_manager
 from src.bandit_ads.db_helpers import (
-    get_campaign, get_arms_by_campaign, 
+    get_campaign, get_arms_by_campaign,
     get_agent_state, update_agent_state,
     get_experiments_by_campaign, record_incrementality_metric
 )
@@ -50,11 +52,6 @@ class ContinuousOptimizationService:
     Uses IncrementalityAwareBandit by default with Thompson Sampling and
     real-time holdout tracking. This provides production-ready optimization
     with incrementality feedback.
-
-    Bayesian integration: Meridian posteriors are periodically refreshed into
-    bandit priors via incorporate_meridian_posteriors() in _optimize_campaign().
-    See meridian_trainer.py for model training and meridian_bridge.py for the
-    posterior-to-Beta conversion.
     """
     
     def __init__(self, config_manager: Optional[ConfigManager] = None, 
@@ -84,8 +81,17 @@ class ContinuousOptimizationService:
         self.budget_push_dry_run = self.config_manager.get('budget_push.dry_run', True)
         self.allocation_change_threshold = 0.01  # 1% minimum change to trigger push
 
+        # Dedicated event loop for async explanation generation from the
+        # optimization thread. Do NOT use asyncio.run() per call — it tears
+        # down the Anthropic client's connection pool.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+
         # Change tracking and explanation generation
         self._init_change_tracker()
+
+        # Cache: arm_key (str) -> arm db id (int), per campaign
+        self._arm_id_cache: Dict[int, Dict[str, int]] = {}
 
         # Statistics
         self.stats = {
@@ -114,57 +120,110 @@ class ContinuousOptimizationService:
             logger.warning(f"Explanation generator unavailable: {e}")
             self.explanation_generator = None
 
+    def _start_event_loop(self):
+        """Spin up a dedicated asyncio event loop in a daemon thread.
+
+        Used to run the async explanation generator from the optimization
+        thread without standing up a new loop (and tearing down the HTTP
+        client pool) on every call.
+        """
+        if self._loop is not None and self._loop.is_running():
+            return
+
+        loop = asyncio.new_event_loop()
+
+        def _run():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        thread = threading.Thread(target=_run, daemon=True, name="OptimizerAsyncLoop")
+        thread.start()
+        self._loop = loop
+        self._loop_thread = thread
+        logger.info("Started dedicated asyncio loop for explanation generation")
+
+    def _stop_event_loop(self):
+        """Stop the dedicated asyncio loop, if running."""
+        if self._loop is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception as e:
+            logger.warning(f"Error stopping async loop: {e}")
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=5)
+        try:
+            self._loop.close()
+        except Exception:
+            pass
+        self._loop = None
+        self._loop_thread = None
+
     def start(self):
         """Start the continuous optimization service."""
         if self.running:
             logger.warning("Service is already running")
             return
-        
+
         self.running = True
         self.shutdown_event.clear()
-        
+
+        # Stand up the async loop before loading campaigns so explanation
+        # generation works on the very first cycle.
+        self._start_event_loop()
+
         # Load active campaigns from database
         self._load_active_campaigns()
-        
+
         # Start optimization loop in background thread
-        import threading
         self.optimization_thread = threading.Thread(
             target=self._optimization_loop,
             daemon=True,
             name="OptimizationLoop"
         )
         self.optimization_thread.start()
-        
+
         logger.info("Continuous optimization service started")
-    
+
     def stop(self, timeout: int = 30):
         """Stop the continuous optimization service."""
         if not self.running:
             logger.warning("Service is not running")
             return
-        
+
         logger.info("Stopping optimization service...")
         self.running = False
         self.shutdown_event.set()
-        
+
         # Wait for optimization thread to finish
         if hasattr(self, 'optimization_thread'):
             self.optimization_thread.join(timeout=timeout)
-        
+
+        # Tear down the async loop after the optimization thread is gone so
+        # in-flight explanation tasks have a chance to finish.
+        self._stop_event_loop()
+
         logger.info("Optimization service stopped")
     
     def _load_active_campaigns(self):
         """Load active campaigns from database and create runners."""
         db_manager = get_db_manager()
+        first_failure: Optional[str] = None
         with db_manager.get_session() as session:
             from src.bandit_ads.database import Campaign
             campaigns = session.query(Campaign).filter(
                 Campaign.status == 'active'
             ).all()
+            total_campaigns = len(campaigns)
 
             for campaign in campaigns:
-                # Build config and create runner for each active campaign
-                config = self._build_campaign_config_from_db(campaign)
+                try:
+                    config = self._build_campaign_config_from_db(campaign)
+                except Exception as e:
+                    config = None
+                    if first_failure is None:
+                        first_failure = f"campaign {campaign.id}: {e}"
+
                 if config:
                     success = self.add_campaign(campaign.id, config)
                     if not success:
@@ -177,12 +236,25 @@ class ContinuousOptimizationService:
                             'last_optimization': None,
                             'optimization_count': 0
                         }
+                        if first_failure is None:
+                            first_failure = f"campaign {campaign.id}: add_campaign returned False"
                         logger.warning(f"Failed to create runner for campaign {campaign.id}")
                 else:
+                    if first_failure is None:
+                        first_failure = f"campaign {campaign.id}: _build_campaign_config_from_db returned None"
                     logger.warning(f"Could not build config for campaign {campaign.id}")
 
         runners_created = len(self.campaign_runners)
-        logger.info(f"Loaded {len(self.active_campaigns)} active campaigns, {runners_created} runners created")
+        if total_campaigns > 0 and runners_created == 0:
+            logger.error(
+                f"Loaded {total_campaigns} active campaigns but created 0 runners. "
+                f"First failure: {first_failure}"
+            )
+        else:
+            logger.info(
+                f"Loaded {len(self.active_campaigns)} active campaigns, "
+                f"{runners_created} runners created"
+            )
 
     def _build_campaign_config_from_db(self, campaign) -> Optional[Dict[str, Any]]:
         """
@@ -218,6 +290,8 @@ class ContinuousOptimizationService:
             creatives = list(set(a.creative for a in arms_db))
             bids = sorted(set(a.bid for a in arms_db))
 
+            global_params = self._aggregate_global_params(campaign.id)
+
             config = {
                 'name': campaign.name,
                 'arms': {
@@ -227,12 +301,7 @@ class ContinuousOptimizationService:
                     'bids': bids
                 },
                 'environment': {
-                    'global_params': {
-                        'ctr': 0.03,
-                        'cvr': 0.08,
-                        'revenue': 10.0,
-                        'cpc': 1.0
-                    },
+                    'global_params': global_params,
                     'mmm_factors': {}
                 },
                 'agent': {
@@ -253,6 +322,51 @@ class ContinuousOptimizationService:
         except Exception as e:
             logger.error(f"Error building config for campaign {campaign.id}: {e}")
             return None
+
+    def _aggregate_global_params(self, campaign_id: int) -> Dict[str, float]:
+        """Aggregate ctr / cvr / revenue-per-conversion / cpc from the metrics table.
+
+        Falls back to documented defaults (and logs a warning) when there is
+        no metric history yet — first-cycle uniform exploration is expected
+        for brand-new campaigns.
+        """
+        defaults = {'ctr': 0.03, 'cvr': 0.08, 'revenue': 10.0, 'cpc': 1.0}
+        try:
+            from sqlalchemy import func
+            from src.bandit_ads.database import Metric
+            db_manager = get_db_manager()
+            with db_manager.get_session() as session:
+                row = session.query(
+                    func.coalesce(func.sum(Metric.impressions), 0),
+                    func.coalesce(func.sum(Metric.clicks), 0),
+                    func.coalesce(func.sum(Metric.conversions), 0),
+                    func.coalesce(func.sum(Metric.revenue), 0.0),
+                    func.coalesce(func.sum(Metric.cost), 0.0),
+                ).filter(Metric.campaign_id == campaign_id).one()
+
+            impressions, clicks, conversions, revenue, cost = row
+            if impressions == 0 and clicks == 0:
+                logger.warning(
+                    f"Campaign {campaign_id} has no metric history; using default "
+                    f"global params (ctr=0.03, cvr=0.08). First cycle will explore uniformly."
+                )
+                return defaults
+
+            ctr = (clicks / impressions) if impressions > 0 else defaults['ctr']
+            cvr = (conversions / clicks) if clicks > 0 else defaults['cvr']
+            revenue_per_conv = (revenue / conversions) if conversions > 0 else defaults['revenue']
+            cpc = (cost / clicks) if clicks > 0 else defaults['cpc']
+            return {
+                'ctr': float(ctr),
+                'cvr': float(cvr),
+                'revenue': float(revenue_per_conv),
+                'cpc': float(cpc),
+            }
+        except Exception as e:
+            logger.warning(
+                f"Could not aggregate metrics for campaign {campaign_id}: {e}; using defaults"
+            )
+            return defaults
     
     def _get_or_create_runner(self, campaign_id: int) -> Optional[AdOptimizationRunner]:
         """Get existing runner or create one from DB config."""
@@ -297,7 +411,18 @@ class ContinuousOptimizationService:
                 
                 # Restore agent state from database
                 self._restore_agent_state(runner, campaign_id)
-                
+
+                # Seed previous_allocations from the restored agent so the
+                # first cycle after restart doesn't flag every arm as "changed"
+                # and trigger an explanation-generation storm.
+                try:
+                    self.previous_allocations[campaign_id] = dict(runner.agent.current_allocation)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not hydrate previous_allocations for campaign {campaign_id}: {e}"
+                    )
+                    self.previous_allocations[campaign_id] = {}
+
                 # Register campaign
                 self.active_campaigns[campaign_id] = {
                     'id': campaign_id,
@@ -444,56 +569,34 @@ class ContinuousOptimizationService:
                         self.active_campaigns[campaign_id]['status'] = CampaignStatus.COMPLETED
                 return False
             
-            # Generate context if using contextual bandit
-            context = None
-            if runner.use_contextual:
-                # In real system, get context from current request/user data
-                # For now, generate synthetic context
-                import random
-                from datetime import datetime, timedelta
-                user_segments = [
-                    {'age': 28, 'gender': 'male', 'location': 'us', 'device_type': 'mobile'},
-                    {'age': 35, 'gender': 'female', 'location': 'eu', 'device_type': 'desktop'},
-                ]
-                context = {
-                    'user_data': random.choice(user_segments),
-                    'timestamp': datetime.now()
-                }
-            
-            # Select arm
-            if runner.use_contextual and hasattr(runner.agent, 'select_arm'):
-                arm = runner.agent.select_arm(context=context)
-            else:
-                arm = runner.agent.select_arm()
-            
+            # Contextual bandits are archived (see src/bandit_ads/_archive/).
+            # The active path is Thompson Sampling / IncrementalityAwareBandit only.
+            arm = runner.agent.select_arm()
+
             if not arm:
                 logger.warning(f"No arm selected for campaign {campaign_id}")
                 return False
-            
+
             # Get impressions per round from config
             impressions = runner.config.get('impressions_per_round', 100)
-            
+
             # Calculate spend amount
             arm_key = str(arm)
             allocated_budget = runner.agent.current_allocation.get(arm_key, 0)
             spend_amount = min(
-                allocated_budget * 0.1, 
+                allocated_budget * 0.1,
                 runner.agent.total_budget * 0.05
             )
-            
+
             # Step environment
             result = runner.environment.step(
-                arm, 
-                impressions=impressions, 
-                spend_amount=spend_amount, 
-                context=context
+                arm,
+                impressions=impressions,
+                spend_amount=spend_amount,
             )
-            
+
             # Update agent
-            if runner.use_contextual and hasattr(runner.agent, 'update'):
-                runner.agent.update(arm, result, context=context)
-            else:
-                runner.agent.update(arm, result)
+            runner.agent.update(arm, result)
             
             # Track holdout metrics for IncrementalityAwareBandit
             if isinstance(runner.agent, IncrementalityAwareBandit):
@@ -507,23 +610,6 @@ class ContinuousOptimizationService:
                 opt_count = self.active_campaigns.get(campaign_id, {}).get('optimization_count', 0)
                 if opt_count % 10 == 0:
                     self._save_agent_state(runner, campaign_id)
-
-            # Refresh bandit priors from Meridian posteriors periodically (every 50 cycles)
-            if (
-                isinstance(runner.agent, IncrementalityAwareBandit)
-                and opt_count > 0
-                and opt_count % 50 == 0
-            ):
-                try:
-                    updated = runner.agent.incorporate_meridian_posteriors(
-                        campaign_id=campaign_id
-                    )
-                    if updated > 0:
-                        logger.info(
-                            f"Campaign {campaign_id}: refreshed {updated} arm priors from Meridian"
-                        )
-                except Exception as exc:
-                    logger.debug(f"Meridian prior refresh skipped: {exc}")
 
             return True
             
@@ -606,6 +692,102 @@ class ContinuousOptimizationService:
         except Exception as e:
             logger.warning(f"Error recording holdout metrics for campaign {campaign_id}: {e}")
     
+    def _arm_key_to_db_id(self, campaign_id: int, arm_key: str) -> Optional[int]:
+        """Resolve a string arm_key (e.g. 'google-search-creative_a-2.5') to the
+        integer Arm.id FK. Caches per campaign. Returns None if no match.
+
+        This is the linchpin fix: AllocationChange.arm_id and AgentState.arm_id
+        are Integer ForeignKey columns. Passing str(arm) silently dropped every
+        write to allocation_changes via a swallowed TypeError.
+        """
+        cache = self._arm_id_cache.setdefault(campaign_id, {})
+        if arm_key in cache:
+            return cache[arm_key]
+
+        # Reduce the arm rows to plain primitives *inside* an active session.
+        # The default sessionmaker uses expire_on_commit=True, so detached ORM
+        # instances raise DetachedInstanceError on attribute access — which the
+        # broad except in _handle_allocation_changes would silently swallow,
+        # leaving allocation_changes empty (the original documentation-theater bug).
+        from src.bandit_ads.database import Arm
+        db_manager = get_db_manager()
+        with db_manager.get_session() as session:
+            arm_rows = [
+                {
+                    'id': a.id,
+                    'platform': a.platform,
+                    'channel': a.channel,
+                    'creative': a.creative,
+                    'bid': float(a.bid),
+                }
+                for a in session.query(Arm).filter(Arm.campaign_id == campaign_id).all()
+            ]
+
+        # 1) Direct match: rebuild the agent-style key (Arm.__repr__ without the
+        #    DB id) from each row and compare against str(agent_arm).
+        for row in arm_rows:
+            agent_style_key = (
+                f"Arm(platform={row['platform']}, channel={row['channel']}, "
+                f"creative={row['creative']}, bid={row['bid']})"
+            )
+            if agent_style_key == arm_key:
+                cache[arm_key] = row['id']
+                return row['id']
+
+        # 2) Structured fallback via the runner's agent arms — handles int/float
+        #    bid formatting drift between the config and the DB Float column.
+        runner = self.campaign_runners.get(campaign_id)
+        if runner is not None:
+            for agent_arm in runner.agent.arms:
+                if str(agent_arm) != arm_key:
+                    continue
+                for row in arm_rows:
+                    if (
+                        row['platform'] == getattr(agent_arm, 'platform', None)
+                        and row['channel'] == getattr(agent_arm, 'channel', None)
+                        and row['creative'] == getattr(agent_arm, 'creative', None)
+                        and row['bid'] == float(getattr(agent_arm, 'bid', 0))
+                    ):
+                        cache[arm_key] = row['id']
+                        return row['id']
+
+        available = [
+            f"Arm(platform={r['platform']}, channel={r['channel']}, "
+            f"creative={r['creative']}, bid={r['bid']})"
+            for r in arm_rows
+        ]
+        logger.error(
+            f"Cannot resolve arm_key {arm_key!r} to a DB Arm.id for campaign {campaign_id}. "
+            f"Available arms: {available}"
+        )
+        return None
+
+    def _schedule_explanation(self, change_id: int) -> None:
+        """Fire-and-forget the async explanation generator on the dedicated loop.
+
+        On success, persist the explanation onto the AllocationChange row.
+        Uses `run_coroutine_threadsafe` rather than `asyncio.run()` so the
+        Anthropic HTTP client's connection pool stays alive across calls.
+        """
+        if not self.explanation_generator or not self.change_tracker:
+            return
+        if self._loop is None or not self._loop.is_running():
+            logger.debug("Async loop not running; skipping explanation for change %s", change_id)
+            return
+
+        async def _run_and_persist():
+            try:
+                text = await self.explanation_generator.explain_allocation_change(change_id)
+                if text:
+                    self.change_tracker.update_explanation(change_id, text)
+            except Exception as e:
+                logger.warning(f"Explanation generation failed for change {change_id}: {e}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_run_and_persist(), self._loop)
+        except Exception as e:
+            logger.warning(f"Could not schedule explanation for change {change_id}: {e}")
+
     def _handle_allocation_changes(self, campaign_id: int, runner: AdOptimizationRunner, result: dict):
         """
         Detect allocation changes, push budgets to platforms, and log decisions.
@@ -635,7 +817,6 @@ class ContinuousOptimizationService:
                 from src.bandit_ads.api_connectors import push_budget_to_platform
                 total_budget = runner.agent.total_budget
                 for arm_key, change in changed_arms.items():
-                    # Find the arm object
                     arm_obj = next((a for a in runner.agent.arms if str(a) == arm_key), None)
                     if arm_obj:
                         daily_budget = change['new'] * total_budget
@@ -644,30 +825,44 @@ class ContinuousOptimizationService:
                             dry_run=self.budget_push_dry_run
                         )
 
-            # Log allocation changes for explainability
+            # Log allocation changes for explainability + schedule explanations
             if self.change_tracker:
                 for arm_key, change in changed_arms.items():
-                    try:
-                        # Build optimizer state snapshot
-                        optimizer_state = {
-                            'alpha': runner.agent.alpha.get(arm_key, 1.0),
-                            'beta': runner.agent.beta.get(arm_key, 1.0),
-                            'risk_score': runner.agent.arm_risk_scores.get(arm_key, 0.0),
-                            'trials': runner.agent.arm_trials.get(arm_key, 0)
-                        }
+                    arm_id = self._arm_key_to_db_id(campaign_id, arm_key)
+                    if arm_id is None:
+                        # Already logged at ERROR by the resolver — skip this row
+                        # rather than passing a bogus FK.
+                        continue
 
-                        self.change_tracker.log_allocation_change(
+                    optimizer_state = {
+                        'alpha': runner.agent.alpha.get(arm_key, 1.0),
+                        'beta': runner.agent.beta.get(arm_key, 1.0),
+                        'risk_score': runner.agent.arm_risk_scores.get(arm_key, 0.0),
+                        'trials': runner.agent.arm_trials.get(arm_key, 0),
+                    }
+
+                    try:
+                        change_id = self.change_tracker.log_allocation_change(
                             campaign_id=campaign_id,
-                            arm_id=arm_key,
+                            arm_id=arm_id,
                             old_allocation=change['old'],
                             new_allocation=change['new'],
                             change_reason='optimization_cycle',
                             factors={'result': {k: v for k, v in result.items() if isinstance(v, (int, float, str))}},
                             optimizer_state=optimizer_state,
-                            change_type='auto'
+                            change_type='auto',
                         )
+                    except TypeError as e:
+                        # The tracker raises TypeError on FK type mismatch — surface it
+                        # rather than letting it silently drop the row.
+                        logger.error(f"FK type error logging change for {arm_key}: {e}")
+                        continue
                     except Exception as e:
-                        logger.debug(f"Failed to log allocation change for {arm_key}: {e}")
+                        logger.error(f"Failed to log allocation change for {arm_key}: {e}")
+                        continue
+
+                    if change_id is not None:
+                        self._schedule_explanation(change_id)
 
             # Store current as previous for next comparison
             self.previous_allocations[campaign_id] = current_allocation
@@ -682,22 +877,17 @@ class ContinuousOptimizationService:
         try:
             agent = runner.agent
             arms = agent.arms
-            
+
             for arm in arms:
                 arm_key = str(arm)
-                
-                # Get or create arm in database
-                arms_db = get_arms_by_campaign(campaign_id)
-                arm_db = next((a for a in arms_db if str(a) == arm_key), None)
-                
-                if not arm_db:
-                    # Would need to create arm - skip for now
+                arm_db_id = self._arm_key_to_db_id(campaign_id, arm_key)
+                if arm_db_id is None:
+                    # Resolver already logged ERROR — skip rather than write a bogus FK.
                     continue
-                
-                # Prepare state data
+
                 state_data = {
                     'campaign_id': campaign_id,
-                    'arm_id': arm_db.id,
+                    'arm_id': arm_db_id,
                     'alpha': agent.alpha.get(arm_key, 1.0),
                     'beta': agent.beta.get(arm_key, 1.0),
                     'spending': agent.arm_spending.get(arm_key, 0.0),
@@ -705,54 +895,34 @@ class ContinuousOptimizationService:
                     'rewards': agent.arm_rewards.get(arm_key, 0.0),
                     'reward_variance': agent.arm_reward_variance.get(arm_key, 0.0),
                     'trials': agent.arm_trials.get(arm_key, 0),
-                    'risk_score': agent.arm_risk_scores.get(arm_key, 0.0)
+                    'risk_score': agent.arm_risk_scores.get(arm_key, 0.0),
                 }
-                
-                # Save contextual state if applicable
-                if runner.use_contextual and hasattr(agent, 'arm_theta'):
-                    contextual_state = {
-                        'arm_theta': agent.arm_theta.get(arm_key),
-                        'arm_A': agent.arm_A.get(arm_key),
-                        'arm_b': agent.arm_b.get(arm_key)
-                    }
-                    state_data['contextual_state'] = json.dumps(contextual_state)
-                
-                # Update or create state using AgentStateUpdate model
+
                 from src.bandit_ads.models import AgentStateUpdate
-                state_update = AgentStateUpdate(
-                    campaign_id=campaign_id,
-                    arm_id=arm_db.id,
-                    **state_data
-                )
+                state_update = AgentStateUpdate(**state_data)
                 update_agent_state(state_update)
-            
+
             logger.debug(f"Saved agent state for campaign {campaign_id}")
-            
+
         except Exception as e:
             logger.error(f"Error saving agent state: {str(e)}")
-    
+
     def _restore_agent_state(self, runner: AdOptimizationRunner, campaign_id: int):
         """Restore agent state from database."""
         try:
             agent = runner.agent
             arms = agent.arms
-            
+
             for arm in arms:
                 arm_key = str(arm)
-                
-                # Get arm from database
-                arms_db = get_arms_by_campaign(campaign_id)
-                arm_db = next((a for a in arms_db if str(a) == arm_key), None)
-                
-                if not arm_db:
+                arm_db_id = self._arm_key_to_db_id(campaign_id, arm_key)
+                if arm_db_id is None:
                     continue
-                
-                # Get saved state
-                state = get_agent_state(campaign_id, arm_db.id)
+
+                state = get_agent_state(campaign_id, arm_db_id)
                 if not state:
                     continue
-                
-                # Restore state
+
                 agent.alpha[arm_key] = state.alpha
                 agent.beta[arm_key] = state.beta
                 agent.arm_spending[arm_key] = state.spending
@@ -761,20 +931,9 @@ class ContinuousOptimizationService:
                 agent.arm_reward_variance[arm_key] = state.reward_variance
                 agent.arm_trials[arm_key] = state.trials
                 agent.arm_risk_scores[arm_key] = state.risk_score
-                
-                # Restore contextual state if applicable
-                if runner.use_contextual and state.contextual_state:
-                    try:
-                        contextual_state = json.loads(state.contextual_state)
-                        if hasattr(agent, 'arm_theta'):
-                            agent.arm_theta[arm_key] = contextual_state.get('arm_theta', [])
-                            agent.arm_A[arm_key] = contextual_state.get('arm_A', {})
-                            agent.arm_b[arm_key] = contextual_state.get('arm_b', [])
-                    except Exception as e:
-                        logger.warning(f"Error restoring contextual state: {str(e)}")
-            
+
             logger.info(f"Restored agent state for campaign {campaign_id}")
-            
+
         except Exception as e:
             logger.error(f"Error restoring agent state: {str(e)}")
     

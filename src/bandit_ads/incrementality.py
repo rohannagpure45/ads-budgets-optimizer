@@ -11,11 +11,6 @@ Current Implementation
 Uses frequentist statistics (normal approximation, permutation tests) for
 lift calculation and confidence intervals. Results feed into IncrementalityAwareBandit
 to adjust Thompson Sampling priors.
-
-Bayesian integration is implemented via the Meridian pipeline. Incrementality results
-feed into Meridian priors (meridian_data.py), and Meridian posteriors flow back to
-bandit priors via meridian_bridge.py. See meridian_insights.py for combined
-model + experiment uncertainty display.
 """
 
 import math
@@ -164,8 +159,6 @@ def calculate_incrementality(
         - relative_lift: Lift as a ratio
         - confidence_interval: 95% CI if sample sizes provided
         - is_significant: Whether lift is statistically significant
-    
-    Bayesian integration: experiment results seed Meridian priors via meridian_data.py.
     """
     # Handle edge cases
     if control_cvr == 0:
@@ -300,8 +293,6 @@ def calculate_incremental_roas(
     
     Returns:
         Dictionary with iROAS and supporting metrics
-    
-    Bayesian integration: iROAS calibrates Meridian channel priors; see meridian_bridge.py.
     """
     if treatment_spend == 0:
         return {

@@ -24,8 +24,7 @@ class MMMDataLoader:
     configurable factors for seasonality, ad stock, and diminishing returns.
 
     Bayesian coefficient estimation with full posteriors is available via the
-    Meridian pipeline (meridian_trainer.py, meridian_data.py). get_arm_priors()
-    falls back to Meridian posteriors via _get_meridian_prior() when available.
+    rule-based MMM coefficients (seasonality, carryover, channel baselines).
     """
 
     def __init__(self):
@@ -203,9 +202,6 @@ class MMMDataLoader:
 
         Returns:
             dict: Prior parameters for beta distribution
-        
-        Bayesian integration: when no historical match is found, this method
-        falls back to _get_meridian_prior() for Meridian-derived posteriors.
         """
         # Create key from arm attributes
         platform = arm.platform.lower().replace(' ', '_')
@@ -247,11 +243,6 @@ class MMMDataLoader:
                     'historical_performance': coeff
                 }
 
-        # Try Meridian posteriors if available
-        meridian_prior = self._get_meridian_prior(platform, channel)
-        if meridian_prior:
-            return meridian_prior
-
         # Ultimate fallback
         return {
             'alpha': 1.0,
@@ -259,43 +250,6 @@ class MMMDataLoader:
             'expected_roas': 1.2,
             'historical_performance': None
         }
-
-    def _get_meridian_prior(self, platform: str, channel: str):
-        """
-        Try to get richer priors from a trained Meridian model.
-        Returns None if Meridian is not available or no model is trained.
-        """
-        try:
-            from src.bandit_ads.meridian_bridge import extract_channel_posteriors, posteriors_to_beta_priors
-            posteriors = extract_channel_posteriors()
-            if not posteriors:
-                return None
-
-            # Match by channel name
-            display = channel.replace('_', ' ').title()
-            if display not in posteriors:
-                # Try platform + channel
-                display = f"{platform.replace('_', ' ').title()} {channel.replace('_', ' ').title()}"
-
-            if display not in posteriors:
-                return None
-
-            post = posteriors[display]
-            beta_priors = posteriors_to_beta_priors({display: post})
-            bp = beta_priors.get(display)
-            if not bp:
-                return None
-
-            return {
-                'alpha': bp['alpha'],
-                'beta': bp['beta'],
-                'expected_roas': post['roas_mean'],
-                'credible_interval_95': (post['roas_lower'], post['roas_upper']),
-                'uncertainty_source': 'meridian',
-                'historical_performance': None,
-            }
-        except Exception:
-            return None
 
     def get_seasonal_multiplier(self, date=None, channel=None):
         """

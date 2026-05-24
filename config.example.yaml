@@ -92,6 +92,18 @@ data_source:
   historical_data_path: null  # Path to historical CSV/JSON data
   update_frequency: 3600  # Seconds between data updates (real-time mode)
 
+# Budget push to live ad platforms (Google Ads only — Meta / Trade Desk
+# write paths are out of scope per CLAUDE.md). Both flags must flip for a
+# real mutation to fire on a customer account.
+#   enabled=false → never call the platform API; recommendations are
+#                   applied locally only.
+#   enabled=true, dry_run=true → call the connector with dry_run=True so
+#                   the change is logged but no API request is made.
+#   enabled=true, dry_run=false → actually mutate the campaign budget.
+budget_push:
+  enabled: false
+  dry_run: true
+
 # MMM engine configuration
 mmm:
   engine: "rule_based"  # "rule_based" | "meridian"

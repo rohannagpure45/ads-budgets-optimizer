@@ -32,37 +32,53 @@ async def get_recent_decisions(
 ):
     """Get recent optimization decisions with explanations."""
     try:
-        from src.bandit_ads.change_tracker import get_change_tracker
+        from src.bandit_ads.change_tracker import get_change_tracker, AllocationChange
+        from src.bandit_ads.database import get_db_manager
+
         tracker = get_change_tracker()
 
-        # Get allocation changes
-        changes = tracker.get_allocation_history(
-            campaign_id=campaign_id,
-            days=30
-        )
+        if campaign_id is not None:
+            changes = tracker.get_allocation_history(campaign_id=campaign_id, days=30)
+            changes = changes[:limit]
+        else:
+            # No campaign filter — query directly across all campaigns.
+            db = get_db_manager()
+            with db.get_session() as session:
+                changes = (
+                    session.query(AllocationChange)
+                    .order_by(AllocationChange.timestamp.desc())
+                    .limit(limit)
+                    .all()
+                )
+                # Materialise inside the session so attrs survive detach.
+                changes = [_change_to_payload(c) for c in changes]
+                return changes
 
-        decisions = []
-        for change in changes:
-            decisions.append({
-                'id': change.id if hasattr(change, 'id') else None,
-                'campaign_id': change.campaign_id,
-                'arm_id': change.arm_id,
-                'old_allocation': change.old_allocation,
-                'new_allocation': change.new_allocation,
-                'change_reason': change.change_reason,
-                'change_type': change.change_type,
-                'factors': change.factors if hasattr(change, 'factors') else {},
-                'mmm_factors': change.mmm_factors if hasattr(change, 'mmm_factors') else {},
-                'optimizer_state': change.optimizer_state if hasattr(change, 'optimizer_state') else {},
-                'explanation_text': getattr(change, 'explanation_text', None),
-                'timestamp': change.timestamp.isoformat() if hasattr(change, 'timestamp') and change.timestamp else None,
-            })
-
-        return decisions
+        return [_change_to_payload(c) for c in changes]
     except Exception as e:
         logger.error(f"Error getting decisions: {str(e)}")
-        # Return empty list on error (e.g. change tracker not available)
         return []
+
+
+def _change_to_payload(change) -> Dict[str, Any]:
+    """Serialise an AllocationChange row for the API."""
+    return {
+        'id': getattr(change, 'id', None),
+        'campaign_id': change.campaign_id,
+        'arm_id': change.arm_id,
+        'old_allocation': change.old_allocation,
+        'new_allocation': change.new_allocation,
+        'change_reason': change.change_reason,
+        'change_type': change.change_type,
+        'factors': getattr(change, 'factors', None) or {},
+        'mmm_factors': getattr(change, 'mmm_factors', None) or {},
+        'optimizer_state': getattr(change, 'optimizer_state', None) or {},
+        'explanation': getattr(change, 'explanation', None),
+        'timestamp': (
+            change.timestamp.isoformat()
+            if getattr(change, 'timestamp', None) else None
+        ),
+    }
 
 
 @router.get("/factor-attribution")
@@ -117,11 +133,7 @@ async def get_latest_explanation(campaign_id: int):
         from src.bandit_ads.change_tracker import get_change_tracker
         tracker = get_change_tracker()
 
-        # Get the most recent change for this campaign
-        changes = tracker.get_allocation_history(
-            campaign_id=campaign_id,
-            limit=5
-        )
+        changes = tracker.get_allocation_history(campaign_id=campaign_id, days=30)
 
         if not changes:
             return {
@@ -130,30 +142,20 @@ async def get_latest_explanation(campaign_id: int):
                 'message': 'No allocation changes recorded yet. The optimizer will generate explanations as it runs.'
             }
 
-        # Return the most recent changes with any stored explanations
         latest = changes[0]
-        explanation_text = getattr(latest, 'explanation_text', None)
-
-        # If no stored explanation, try generating one on the fly
-        if not explanation_text:
-            try:
-                from src.bandit_ads.explanation_generator import ExplanationGenerator
-                generator = ExplanationGenerator()
-                explanation_text = generator.explain_allocation_change(
-                    change_id=latest.id if hasattr(latest, 'id') else None
-                )
-            except Exception:
-                explanation_text = None
+        explanation_text = getattr(latest, 'explanation', None)
+        change_id = getattr(latest, 'id', None)
 
         return {
             'campaign_id': campaign_id,
             'explanation': explanation_text,
             'latest_change': {
+                'id': change_id,
                 'arm_id': latest.arm_id,
                 'old_allocation': latest.old_allocation,
                 'new_allocation': latest.new_allocation,
                 'change_reason': latest.change_reason,
-                'timestamp': latest.timestamp.isoformat() if hasattr(latest, 'timestamp') and latest.timestamp else None,
+                'timestamp': latest.timestamp.isoformat() if getattr(latest, 'timestamp', None) else None,
             },
             'recent_changes_count': len(changes),
         }
@@ -164,3 +166,42 @@ async def get_latest_explanation(campaign_id: int):
             'explanation': None,
             'message': f'Error: {str(e)}'
         }
+
+
+@router.post("/pause")
+async def pause_optimizer():
+    """Stop the continuous optimization service."""
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service.stop()
+        return {"success": True, "status": "paused"}
+    except Exception as e:
+        logger.error(f"Error pausing optimizer: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/resume")
+async def resume_optimizer():
+    """Start the continuous optimization service."""
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service.start()
+        return {"success": True, "status": "running"}
+    except Exception as e:
+        logger.error(f"Error resuming optimizer: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/run")
+async def force_optimization_run():
+    """Trigger an immediate optimization cycle."""
+    try:
+        from src.bandit_ads.optimization_service import get_optimization_service
+        service = get_optimization_service()
+        service._run_optimization_cycle()
+        return {"success": True, "message": "Optimization cycle triggered"}
+    except Exception as e:
+        logger.error(f"Error forcing optimization run: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

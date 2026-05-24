@@ -80,6 +80,7 @@ class RecommendationEngine:
     def __init__(self):
         """Initialize recommendation engine."""
         self.optimization_service = get_optimization_service()
+        self.db_manager = get_db_manager()
         logger.info("Recommendation engine initialized")
     
     def generate_allocation_recommendation(
@@ -90,27 +91,52 @@ class RecommendationEngine:
         reason: str,
         confidence: float = 0.7
     ) -> Dict[str, Any]:
+        """Generate an allocation change recommendation with concrete impact math.
+
+        ``current_allocation`` is read from the live runner's agent state when
+        available, falling back to the campaign's recent spend share. The
+        impact estimate uses the campaign's historical ROAS over the last 30
+        days of ``Metric`` rows.
         """
-        Generate an allocation change recommendation.
-        
-        Args:
-            campaign_id: Campaign ID
-            arm_id: Arm ID
-            suggested_allocation: Suggested allocation (0.0-1.0)
-            reason: Reason for recommendation
-            confidence: Confidence score (0.0-1.0)
-        
-        Returns:
-            Recommendation dictionary
-        """
-        # Get current state
-        campaign_status = self.optimization_service.get_campaign_status(campaign_id)
-        if not campaign_status:
-            return {"error": "Campaign not found"}
-        
-        current_allocation = 0.0  # TODO: Get from optimizer state
-        
-        recommendation = {
+        from sqlalchemy import and_ as _and, func as _func
+        from src.bandit_ads.database import Arm, Campaign, Metric
+
+        with self.db_manager.get_session() as session:
+            campaign = session.query(Campaign).filter(Campaign.id == campaign_id).first()
+            if not campaign:
+                return {"error": "Campaign not found"}
+            total_budget = float(campaign.budget) if campaign.budget else 0.0
+
+        current_allocation = self._current_allocation(campaign_id, arm_id)
+
+        with self.db_manager.get_session() as session:
+
+            window_start = datetime.utcnow() - timedelta(days=30)
+            agg = session.query(
+                _func.sum(Metric.cost),
+                _func.sum(Metric.revenue),
+            ).filter(
+                _and(
+                    Metric.campaign_id == campaign_id,
+                    Metric.timestamp >= window_start,
+                )
+            ).first()
+            recent_cost = float(agg[0] or 0.0)
+            recent_revenue = float(agg[1] or 0.0)
+            historical_roas = (recent_revenue / recent_cost) if recent_cost > 0 else 0.0
+
+        delta_allocation = suggested_allocation - current_allocation
+        additional_spend = delta_allocation * total_budget
+        expected_revenue = additional_spend * historical_roas
+
+        current_total_revenue = recent_revenue
+        current_total_cost = recent_cost
+        projected_cost = current_total_cost + additional_spend
+        projected_revenue = current_total_revenue + expected_revenue
+        new_roas = projected_revenue / projected_cost if projected_cost > 0 else 0.0
+        roas_impact = round(new_roas - historical_roas, 4)
+
+        return {
             "type": RecommendationType.ALLOCATION_CHANGE.value,
             "title": f"Allocation Change Recommendation: Arm {arm_id}",
             "description": reason,
@@ -118,16 +144,51 @@ class RecommendationEngine:
             "arm_id": arm_id,
             "current_allocation": current_allocation,
             "suggested_allocation": suggested_allocation,
-            "change_percent": ((suggested_allocation - current_allocation) / current_allocation * 100) if current_allocation > 0 else 0,
+            "change_percent": (
+                (delta_allocation / current_allocation * 100)
+                if current_allocation > 0 else 0
+            ),
             "confidence": confidence,
             "estimated_impact": {
-                "additional_spend": 0,  # TODO: Calculate
-                "expected_revenue": 0,  # TODO: Calculate
-                "roas_impact": 0  # TODO: Calculate
-            }
+                "additional_spend": round(additional_spend, 2),
+                "expected_revenue": round(expected_revenue, 2),
+                "roas_impact": roas_impact,
+                "historical_roas": round(historical_roas, 4),
+            },
         }
-        
-        return recommendation
+
+    def _current_allocation(self, campaign_id: int, arm_id: int) -> float:
+        """Resolve the arm's current allocation share.
+
+        Prefers the live runner's agent state; falls back to the arm's
+        share of last-30-day spend when the optimizer isn't running for
+        this campaign.
+        """
+        from sqlalchemy import and_ as _and, func as _func
+        from src.bandit_ads.database import Arm, Metric
+
+        runner = self.optimization_service.campaign_runners.get(campaign_id)
+        if runner and getattr(runner, "agent", None):
+            with self.db_manager.get_session() as session:
+                arm_row = session.query(Arm).filter(Arm.id == arm_id).first()
+                if arm_row:
+                    arm_key = f"{arm_row.platform}_{arm_row.channel}_{arm_row.creative}_{arm_row.bid}"
+                    current = runner.agent.current_allocation.get(arm_key)
+                    if current is not None:
+                        return float(current)
+
+        with self.db_manager.get_session() as session:
+            window_start = datetime.utcnow() - timedelta(days=30)
+            arm_spend = session.query(_func.sum(Metric.cost)).filter(
+                _and(Metric.arm_id == arm_id, Metric.timestamp >= window_start)
+            ).scalar() or 0.0
+            campaign_spend = session.query(_func.sum(Metric.cost)).filter(
+                _and(
+                    Metric.campaign_id == campaign_id,
+                    Metric.timestamp >= window_start,
+                )
+            ).scalar() or 0.0
+            return (float(arm_spend) / float(campaign_spend)) if campaign_spend > 0 else 0.0
     
     def generate_budget_recommendation(
         self,

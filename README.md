@@ -1,299 +1,54 @@
-# Ads Budgets Optimizer
+# IPSA — Intelligent Platform for Strategic Advertising
 
-A production-ready multi-armed bandit system for optimizing advertising spend across platforms, channels, creatives, and bidding strategies. Features comprehensive MMM (Marketing Mix Modeling) integration and real-time API connectivity.
+**Status: pre-alpha.** A salvage of an earlier prototype. The bones are real
+(Thompson Sampling bandit, SQLAlchemy schema, FastAPI + Streamlit surface,
+Google Ads connector), but several integration points are being wired up in
+the current restructure. See [STATUS.md](STATUS.md) for an honest "what
+works / what doesn't" matrix and [ROADMAP.md](ROADMAP.md) for the salvage
+plan.
 
-## Features
+## What it does
 
-- **Multi-Armed Bandit Optimization**: Thompson Sampling with risk constraints
-- **Contextual Bandits (Optional)**: Learn arm performance conditioned on user demographics, time-of-day, device, and custom features
-- **MMM Integration**: Seasonality, competitive effects, carryover/ad stock, external factors
-- **Real-Time API Support**: Google Ads, Meta Ads, The Trade Desk connectors
-- **Historical Data Loading**: Initialize priors from past performance
-- **Budget-Constrained Optimization**: Intelligent budget allocation across arms
-- **ROAS-Focused**: Optimizes for Return on Ad Spend
-- **Production-Ready**: Logging, error handling, configuration management
+IPSA optimizes advertising budget allocation across arms (combinations of
+platform / channel / creative / bid) using a multi-armed bandit. A
+rule-based MMM layer adjusts for seasonality and carryover effects, and an
+LLM layer generates human-readable explanations for each reallocation
+decision.
 
-## Installation
+- **Optimizer:** Thompson Sampling with incrementality-aware updates from
+  holdout experiments.
+- **Write path:** Google Ads `CampaignBudgetService.mutate_campaign_budgets`
+  (behind a `budget_push.enabled` flag, dry-run by default).
+- **Dashboard:** Streamlit, served separately from the FastAPI backend.
+- **Explanations:** Anthropic Claude API; falls back to a template-only
+  generator when no API key is configured.
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd ads-budgets-optimizer
+## Scope (today)
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+In scope: Google Ads, Thompson Sampling, rule-based MMM factors,
+explanation generation, Streamlit dashboard, SQLite persistence.
 
-# Install dependencies
-pip install -r requirements.txt
-```
+Archived (kept in `src/bandit_ads/_archive/`, may return later): Bayesian
+Meridian MMM, contextual bandits (LinUCB), Meta / Trade Desk write paths,
+incrementality auto-apply.
 
-## Quick Start
+## Getting started
 
-### Basic Simulation
+See [QUICK_START.md](QUICK_START.md) for the three commands.
 
-```bash
-python scripts/run_simulation.py
-```
-
-### Full Campaign with Configuration
-
-```python
-from src.bandit_ads.runner import AdOptimizationRunner, create_sample_campaign_config
-from src.bandit_ads.utils import ConfigManager
-
-# Load configuration
-config_manager = ConfigManager('config.yaml')
-config = create_sample_campaign_config()
-
-# Run campaign
-runner = AdOptimizationRunner(config, config_manager)
-runner.setup_campaign()
-results = runner.run_campaign(max_rounds=100)
-runner.print_summary()
-```
-
-## Configuration
-
-### Configuration File
-
-Copy `config.example.yaml` to `config.yaml` and customize:
-
-```yaml
-# Logging
-logging:
-  level: INFO
-  file: logs/bandit_ads.log
-
-# Agent settings
-agent:
-  total_budget: 5000.0
-  risk_tolerance: 0.3
-  variance_limit: 0.1
-```
-
-### Environment Variables
-
-Set API credentials via environment variables:
-
-```bash
-export GOOGLE_ADS_CLIENT_ID="your_client_id"
-export GOOGLE_ADS_CLIENT_SECRET="your_client_secret"
-export GOOGLE_ADS_REFRESH_TOKEN="your_refresh_token"
-export META_ACCESS_TOKEN="your_meta_token"
-```
-
-Or use a `.env` file:
+## Project layout
 
 ```
-GOOGLE_ADS_CLIENT_ID=your_client_id
-GOOGLE_ADS_CLIENT_SECRET=your_client_secret
+src/bandit_ads/          # core optimizer, agents, DB, API, integrations
+src/bandit_ads/api/      # FastAPI app + routes (12 routers)
+src/bandit_ads/_archive/ # parked modules (Meridian, contextual bandits)
+frontend/                # Streamlit app
+frontend/pages/          # page-routed Streamlit pages
+scripts/                 # CLI entrypoints (run_api, run_simulation, ...)
+tests/                   # pytest test suite
+docs/archive/            # historical design + status docs (do not trust)
 ```
-
-## Real-Time API Integration
-
-### Setting Up API Connectors
-
-```python
-from src.bandit_ads.api_connectors import create_api_connector
-from src.bandit_ads.realtime_env import RealTimeEnvironment
-
-# Create connectors
-google_connector = create_api_connector('google', {
-    'client_id': 'your_client_id',
-    'client_secret': 'your_client_secret',
-    'refresh_token': 'your_refresh_token',
-    'developer_token': 'your_developer_token',
-    'customer_id': 'your_customer_id'
-})
-
-meta_connector = create_api_connector('meta', {
-    'access_token': 'your_access_token',
-    'app_id': 'your_app_id',
-    'app_secret': 'your_app_secret',
-    'ad_account_id': 'your_ad_account_id'
-})
-
-# Create real-time environment
-env = RealTimeEnvironment(
-    api_connectors={
-        'google': google_connector,
-        'meta': meta_connector
-    },
-    fallback_to_simulated=True  # Use simulation if APIs fail
-)
-```
-
-## Project Structure
-
-```
-ads-budgets-optimizer/
-├── src/
-│   └── bandit_ads/
-│       ├── __init__.py
-│       ├── agent.py          # Thompson Sampling bandit agent
-│       ├── arms.py           # Arm definitions and management
-│       ├── env.py            # Simulated environment
-│       ├── realtime_env.py   # Real-time API environment
-│       ├── api_connectors.py # API connectors (Google, Meta, TTD)
-│       ├── data_loader.py    # Historical data loading
-│       ├── runner.py         # Campaign orchestration
-│       ├── contextual_agent.py  # Contextual bandit agent
-│       ├── context_features.py  # Context feature extraction
-│       ├── utils.py          # Utilities (logging, config, errors)
-│       └── metrics.py        # Performance metrics
-├── scripts/
-│   ├── run_simulation.py     # Basic simulation script
-│   └── run_contextual_example.py  # Contextual bandit example
-├── tests/                    # Test files
-├── config.example.yaml       # Example configuration
-├── requirements.txt          # Python dependencies
-└── README.md                 # This file
-```
-
-## Testing
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run specific test
-pytest tests/test_agent.py
-
-# With coverage
-pytest --cov=src/bandit_ads tests/
-```
-
-## Logging
-
-Logs are written to console and optionally to a file:
-
-```python
-from src.bandit_ads.utils import setup_logging
-
-setup_logging(log_level='DEBUG', log_file='logs/app.log')
-```
-
-## Error Handling
-
-The system includes comprehensive error handling:
-
-- **Retry Logic**: Automatic retries for API calls
-- **Fallback**: Graceful fallback to simulation if APIs fail
-- **Validation**: Input validation for all parameters
-- **Logging**: Detailed error logging for debugging
-
-## Advanced Features
-
-### Contextual Bandits (Optional)
-
-Enable contextual bandits to learn arm performance conditioned on user demographics, time-of-day, device type, and custom features. This provides more granular optimization than the standard bandit.
-
-**Configuration:**
-
-```yaml
-contextual:
-  enabled: true  # Set to true to enable
-  alpha: 1.0     # Exploration parameter (higher = more exploration)
-  features:
-    demographics:
-      age_group: true
-      gender: true
-      location: true
-    temporal:
-      hour: true
-      day_of_week: true
-      month: true
-      is_weekend: true
-    device:
-      device_type: true
-      os: false
-    custom:
-      user_segment: ["high_value", "medium_value", "low_value"]
-```
-
-**Usage:**
-
-```python
-from src.bandit_ads.runner import AdOptimizationRunner, create_sample_campaign_config
-
-# Create config with contextual bandit enabled
-config = create_sample_campaign_config()
-config['contextual'] = {
-    'enabled': True,
-    'features': {
-        'demographics': {'age_group': True, 'gender': True},
-        'temporal': {'hour': True, 'day_of_week': True}
-    }
-}
-
-# Run campaign
-runner = AdOptimizationRunner(config)
-runner.setup_campaign()
-results = runner.run_campaign(max_rounds=100)
-```
-
-**Example Script:**
-
-```bash
-python scripts/run_contextual_example.py
-```
-
-**How It Works:**
-
-- The contextual bandit uses a linear model (LinUCB) to learn: `reward = context^T * theta_arm`
-- Each arm has its own linear model that learns how context affects performance
-- The agent selects arms based on both arm attributes and current context
-- Falls back to standard Thompson Sampling if context is not provided
-
-**Benefits:**
-
-- More granular optimization (e.g., "Google Search works better for 25-34 age group in the evening")
-- Better budget allocation across user segments
-- Adapts to temporal patterns (time-of-day, day-of-week effects)
-- Customizable features for your specific use case
-
-### MMM Factors
-
-Configure seasonality, competition, and carryover effects:
-
-```yaml
-mmm_factors:
-  seasonality:
-    Q4:
-      Search: 1.20
-      Display: 1.25
-      Social: 1.30
-  carryover:
-    decay_rate: 0.8
-    max_stock: 2.0
-```
-
-### Risk Constraints
-
-Control risk tolerance:
-
-```python
-agent = ThompsonSamplingAgent(
-    arms=arms,
-    total_budget=10000.0,
-    risk_tolerance=0.2,    # Lower = more risk-averse
-    variance_limit=0.05   # Max variance allowed
-)
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
 
 ## License
 
-[Your License Here]
-
-## Support
-
-For issues and questions, please open an issue on GitHub.
+Proprietary / not yet specified.
