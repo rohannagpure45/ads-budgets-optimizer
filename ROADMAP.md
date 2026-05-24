@@ -73,14 +73,23 @@ Drive-bys done while we were in the area:
   `POST /api/campaigns/{id}/pause|resume` so the data service's button
   paths actually have endpoints to call.
 
-## Phase 3 — Google Ads write path
+## Phase 3 — Google Ads write path ✅
 
-1. Wire `approve_recommendation` to call
-   `push_budget_to_platform(arm, new_budget, dry_run=...)`.
-2. Feature-flag in `config.example.yaml` — `budget_push.enabled: false`,
-   `dry_run: true` by default; both must flip for a real mutation.
-3. Add a sandbox integration test gated by
-   `GOOGLE_ADS_TEST_CUSTOMER_ID`.
+1. **`approve_recommendation` pushes to the platform.**
+   `api/routes/recommendations.py::approve_recommendation` now parses
+   `rec.details`, resolves the `Arm` via `arm_id` or `arm_key`, computes
+   `new_budget = suggested_allocation * campaign.budget` (or
+   `new_budget` directly for `BUDGET_ADJUSTMENT`), and calls
+   `push_budget_to_platform(arm, new_budget, dry_run=...)`. On push
+   failure the row is marked `status="failed"`, `push_error` is stored in
+   `details`, and the response is `502`.
+2. **Feature flag in `config.example.yaml`** — added `budget_push.enabled:
+   false` and `budget_push.dry_run: true`. Both must flip for a real
+   Google Ads mutation to fire. Read via `ConfigManager` in the route.
+3. **Sandbox integration test** `tests/integration/test_google_ads_push.py`
+   gated by `GOOGLE_ADS_TEST_CUSTOMER_ID`. Includes a dry-run smoke
+   (no creds required) and an end-to-end round-trip that asserts
+   `amount_micros == 50_000_000` after a $50 mutation.
 
 ## Phase 4 — Tests + verification
 

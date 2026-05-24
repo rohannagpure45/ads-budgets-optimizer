@@ -1,6 +1,6 @@
-# IPSA Status — Phase 2 (dashboard + Ask on real data)
+# IPSA Status — Phase 3 (Google Ads write path)
 
-Last updated after Phase 2 of the salvage plan. This document replaces the
+Last updated after Phase 3 of the salvage plan. This document replaces the
 eight conflicting "COMPLETE" declarations in `docs/archive/`. If anything
 in this file disagrees with code, the code is the source of truth — file
 an issue and update this doc.
@@ -50,14 +50,18 @@ an issue and update this doc.
   `mutate_campaign_budgets` are real code, not stubs. Behind
   `budget_push.enabled` (default `false`) and `budget_push.dry_run`
   (default `true`).
+- **`POST /api/recommendations/{id}/approve` pushes to the platform.**
+  Resolves the `Arm` via `arm_id` or `arm_key`, computes the new daily
+  budget, and calls `push_budget_to_platform(arm, new_budget,
+  dry_run=...)` when `budget_push.enabled` is `true`. Both flags
+  (`enabled` + `dry_run` flipped to `false`) must be set for a real
+  Google Ads mutation. On failure: `status="failed"`, `push_error`
+  stored in `details`, HTTP `502`.
 - **MMM insights** — rule-based channel summaries, saturation curves, and
   optimal allocations via `mmm_insights.MMMInsightsEngine`.
 
 ## Works only in simulation
 
-- The **Google Ads write path is not yet invoked from
-  `approve_recommendation`** — it currently only updates row status.
-  Phase 3.
 - **MMM factors (seasonality / carryover)** are configured per-campaign,
   not learned.
 - **Global params** (ctr / cvr / cpc / revenue-per-conversion) are
@@ -102,6 +106,25 @@ Now living in `src/bandit_ads/_archive/`:
 
 ## Recently changed
 
+- **Phase 3:** wired the Google Ads write path behind the existing
+  feature flags.
+  - `api/routes/recommendations.py::approve_recommendation` now parses
+    `rec.details`, resolves the `Arm` (via `arm_id` or `arm_key`),
+    computes `new_budget = suggested_allocation * campaign.budget` (or
+    uses `new_budget` directly for `BUDGET_ADJUSTMENT`), and calls
+    `push_budget_to_platform(arm, new_budget, dry_run=...)`.
+    Failures mark the row `status="failed"`, store `push_error` in
+    `details`, and respond `502`. Disabled push still applies locally
+    and returns the resolved push metadata on the response.
+  - Added a `budget_push:` block to `config.example.yaml`
+    (`enabled: false`, `dry_run: true`) so the safe defaults are
+    explicit.
+  - Added `tests/integration/__init__.py` and
+    `tests/integration/test_google_ads_push.py`. The full round-trip is
+    skipped unless `GOOGLE_ADS_TEST_CUSTOMER_ID` is set; the dry-run
+    smoke runs whenever the env var is present and asserts
+    `push_budget_to_platform(arm, 50, dry_run=True)` returns `True`
+    without authenticating.
 - **Phase 2:** put the dashboard and Ask page on real data.
   - Rewrote `frontend/services/data_service.py` from ~2,360 lines of
     `_mock_*` branches down to a thin real-only HTTP client. New
