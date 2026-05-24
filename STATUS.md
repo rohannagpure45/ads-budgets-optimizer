@@ -1,6 +1,6 @@
-# IPSA Status — Phase 4 (Tests + verification)
+# IPSA Status — Phase 6 (RAG integration gap closed)
 
-Last updated after Phase 4 of the salvage plan. This document replaces the
+Last updated after Phase 6 of the salvage plan. This document replaces the
 eight conflicting "COMPLETE" declarations in `docs/archive/`. If anything
 in this file disagrees with code, the code is the source of truth — file
 an issue and update this doc.
@@ -59,12 +59,21 @@ an issue and update this doc.
   stored in `details`, HTTP `502`.
 - **MMM insights** — rule-based channel summaries, saturation curves, and
   optimal allocations via `mmm_insights.MMMInsightsEngine`.
+- **Vector store / RAG memory is wired end-to-end.** Every explained
+  allocation change is indexed into the vector store
+  (`ExplanationGenerator._index_decision` →
+  `VectorStore.add_decision_explanation`), and the Ask page retrieves and
+  formats that history for `EXPLANATION` / `ANALYSIS` queries
+  (`orchestrator.process_query` → `_format_rag_context`). Degrades
+  gracefully to no-RAG when ChromaDB or the LLM is unavailable: indexing is
+  a best-effort no-op and retrieval is skipped. Covered by
+  `tests/test_rag_indexing.py`.
 - **The spine is now covered by an end-to-end test.**
   `tests/test_e2e_spine.py` runs three real optimization cycles against an
   in-memory DB and asserts `allocation_changes` rows exist, each with a
   real integer arm FK and a generated `explanation`, then reads the latest
   decision back through the API. `tests/test_api_smoke.py` GETs every route
-  and asserts no 5xx. Full suite: `pytest -q` → **65 passed, 4 skipped**.
+  and asserts no 5xx. Full suite: `pytest -q` → **68 passed, 4 skipped**.
 
 ## Works only in simulation
 
@@ -91,8 +100,6 @@ Now living in `src/bandit_ads/_archive/`:
 - **Incrementality auto-apply** — experiments can be designed and metrics
   recorded; automated bandit-prior updates from results are not yet wired
   end-to-end.
-- **Vector store / RAG** — `vector_store.py` and `chromadb` dependency
-  remain, but no live retrieval path is wired into the Ask page yet.
 
 ## Known fragility
 
@@ -108,9 +115,33 @@ Now living in `src/bandit_ads/_archive/`:
   before any public deploy.
 - **No authentication.** `auth.py` exists; it is not enforced on the
   routers.
+- **Scheduler auto-start and data-upload persistence remain deferred.**
+  `scheduler.py` (APScheduler jobs) is not auto-started on API boot, and
+  the data-upload path does not persist beyond the request. Both are parked
+  by decision — see ROADMAP "Deferred / parked".
 
 ## Recently changed
 
+- **Phase 6:** closed the RAG integration gap — the memory loop looked
+  built but had never stored or surfaced a single decision.
+  - **`add_decision_explanation` had zero callers**, so the vector store was
+    always empty. `ExplanationGenerator.explain_allocation_change` now
+    captures `campaign_id` into `change_data` and, after generating the
+    explanation (LLM or template), calls a new `_index_decision` helper that
+    writes to the store. `explain_allocation_change` has exactly one caller
+    (`optimization_service._schedule_explanation`), so every logged change
+    is indexed once — no double-indexing. Indexing is best-effort: a no-op
+    when no store is configured and try/except-guarded otherwise, so a
+    ChromaDB hiccup never breaks explanation generation.
+  - **Fixed the dead-code bug in `orchestrator.process_query`:** the
+    `if rag_results: rag_context = self._format_rag_context(...)` block was
+    nested inside the `else:` branch where `rag_results` had just been set
+    to `None`, so retrieved history was never formatted or used. Retrieval
+    and formatting are now independent of the `if/else`.
+  - Added `tests/test_rag_indexing.py`: asserts a generated explanation
+    pushes exactly one document with the right `campaign_id` / `arm_id`,
+    that indexing is a silent no-op with no store, and that
+    `_format_rag_context` surfaces retrieved history.
 - **Phase 4:** added the test harness and let it find the bugs the earlier
   "COMPLETE" docs hid.
   - Pinned `pytest` / `pytest-asyncio` / `httpx` in `requirements.txt`;

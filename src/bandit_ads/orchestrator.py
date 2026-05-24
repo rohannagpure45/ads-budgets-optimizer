@@ -134,6 +134,7 @@ class OrchestratorAgent:
             
             # 5. Retrieve relevant context from RAG
             rag_context = None
+            rag_results = None
             if query_type in [QueryType.EXPLANATION, QueryType.ANALYSIS] and self.vector_store:
                 try:
                     rag_results = self.vector_store.search_similar_decisions(
@@ -142,10 +143,8 @@ class OrchestratorAgent:
                 except Exception as e:
                     logger.debug(f"Could not retrieve RAG context: {e}")
                     rag_results = None
-            else:
-                rag_results = None
-                if rag_results:
-                    rag_context = self._format_rag_context(rag_results)
+            if rag_results:
+                rag_context = self._format_rag_context(rag_results)
             
             # 6. Build tool context (available MCP tools)
             tool_context = self._build_tool_context()

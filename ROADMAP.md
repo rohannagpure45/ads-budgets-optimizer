@@ -134,6 +134,28 @@ Replace the eight conflicting "COMPLETE" declarations with a single
 honest "what works / what doesn't" doc. (Done as part of Phase 0
 already, will be re-tightened as each later phase lands.)
 
+## Phase 6 — Close the RAG integration gap ✅
+
+The interpretability layer's RAG memory looked built but had never stored
+or surfaced a single decision. Closed the loop:
+
+1. **`add_decision_explanation` had zero callers.** Added
+   `ExplanationGenerator._index_decision` and call it from
+   `explain_allocation_change` (the single chokepoint — one caller via
+   `optimization_service._schedule_explanation`) so every explained change
+   is indexed exactly once. `change_data` now carries `campaign_id`.
+   Indexing is best-effort: a no-op without a store, try/except-guarded
+   against an optional ChromaDB.
+2. **Fixed the dead-code bug in `orchestrator.process_query`.** The
+   `if rag_results: rag_context = self._format_rag_context(...)` block was
+   nested inside the `else:` branch where `rag_results` had just been set
+   to `None`. Retrieval and formatting are now independent of the
+   `if/else`, so the Ask page actually uses retrieved history.
+3. **`tests/test_rag_indexing.py`** proves the write happens (one document,
+   correct FKs), that indexing degrades to a no-op without a store, and
+   that `_format_rag_context` surfaces history. Full suite: `pytest -q` →
+   **68 passed, 4 skipped**.
+
 ## Deferred / parked
 
 - Bayesian Meridian MMM (re-add when the rule-based MMM bottlenecks
@@ -142,6 +164,9 @@ already, will be re-tightened as each later phase lands.)
   than budget-allocation accuracy).
 - Meta Ads / Trade Desk write paths.
 - Incrementality auto-apply.
-- Vector-store / RAG integration into the Ask page.
+- Scheduler auto-start on API boot (`scheduler.py` APScheduler jobs are
+  not started by the FastAPI lifespan hooks).
+- Data-upload persistence (the upload path does not persist beyond the
+  request).
 - Alembic migrations.
 - Authentication enforcement on routers.
