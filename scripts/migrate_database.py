@@ -100,6 +100,43 @@ def migrate_campaigns_table():
             return False
 
 
+def migrate_allocation_changes_table():
+    """Add explanation column to allocation_changes table if it doesn't exist."""
+    db_manager = get_db_manager()
+
+    with db_manager.get_session() as session:
+        try:
+            # Table may not exist yet on fresh installs — create_tables() handles that.
+            existing_tables = session.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='allocation_changes'"
+            )).fetchone()
+            if not existing_tables:
+                logger.info("Table 'allocation_changes' does not exist yet — skipping (create_tables will handle it)")
+                return True
+
+            result = session.execute(text(
+                "PRAGMA table_info(allocation_changes)"
+            ))
+            columns = [row[1] for row in result]
+
+            if 'explanation' in columns:
+                logger.info("Column 'explanation' already exists in allocation_changes table")
+            else:
+                logger.info("Adding 'explanation' column to allocation_changes table...")
+                session.execute(text(
+                    "ALTER TABLE allocation_changes ADD COLUMN explanation TEXT"
+                ))
+                session.commit()
+                logger.info("Successfully added 'explanation' column")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error migrating allocation_changes table: {str(e)}")
+            session.rollback()
+            return False
+
+
 def recreate_database():
     """Drop and recreate all tables (WARNING: This deletes all data!)."""
     db_manager = get_db_manager()
@@ -138,6 +175,7 @@ def main():
         success = True
         success = success and migrate_arms_table()
         success = success and migrate_campaigns_table()
+        success = success and migrate_allocation_changes_table()
         
         if success:
             print("✅ Migration completed successfully")

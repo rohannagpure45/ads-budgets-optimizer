@@ -52,7 +52,10 @@ class AllocationChange(Base):
     change_type = Column(String(50), nullable=False)  # auto, manual, override
     initiated_by = Column(Integer, ForeignKey('users.id'), nullable=True)  # User ID if manual
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    
+
+    # LLM-generated natural language explanation (populated post-insert)
+    explanation = Column(Text, nullable=True)
+
     # Relationships
     campaign = relationship("Campaign")
     arm = relationship("Arm")
@@ -108,7 +111,7 @@ class ChangeTracker:
         performance_before: Optional[Dict[str, Any]] = None,
         performance_after: Optional[Dict[str, Any]] = None,
         initiated_by: Optional[int] = None
-    ) -> Optional[AllocationChange]:
+    ) -> Optional[int]:
         """
         Log an allocation change.
         
@@ -127,11 +130,20 @@ class ChangeTracker:
             initiated_by: User ID if manual change
         
         Returns:
-            AllocationChange object
+            New AllocationChange row id, or None on error.
         """
+        if not isinstance(campaign_id, int) or not isinstance(arm_id, int):
+            # FK columns are Integer — silently swallowing a type error here is how
+            # the allocation_changes table stayed empty for months. Fail loud.
+            raise TypeError(
+                f"log_allocation_change requires int FKs; got "
+                f"campaign_id={campaign_id!r} (type {type(campaign_id).__name__}), "
+                f"arm_id={arm_id!r} (type {type(arm_id).__name__})"
+            )
+
         try:
             change_percent = ((new_allocation - old_allocation) / old_allocation * 100) if old_allocation > 0 else 0
-            
+
             with self.db_manager.get_session() as session:
                 change = AllocationChange(
                     campaign_id=campaign_id,
@@ -152,15 +164,33 @@ class ChangeTracker:
                 session.add(change)
                 session.commit()
                 session.refresh(change)
-                
+                new_id = change.id
+
                 logger.info(
-                    f"Logged allocation change: campaign {campaign_id}, arm {arm_id}, "
+                    f"Logged allocation change id={new_id}: campaign {campaign_id}, arm {arm_id}, "
                     f"{old_allocation:.2%} -> {new_allocation:.2%} ({change_type})"
                 )
-                return change
+                return new_id
         except Exception as e:
             logger.error(f"Error logging allocation change: {str(e)}")
             return None
+
+    def update_explanation(self, change_id: int, explanation: str) -> bool:
+        """Persist an LLM-generated explanation onto an AllocationChange row."""
+        try:
+            with self.db_manager.get_session() as session:
+                change = session.query(AllocationChange).filter(
+                    AllocationChange.id == change_id
+                ).first()
+                if not change:
+                    logger.warning(f"AllocationChange {change_id} not found for explanation update")
+                    return False
+                change.explanation = explanation
+                session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error updating explanation for change {change_id}: {e}")
+            return False
     
     def log_decision(
         self,

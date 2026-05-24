@@ -13,29 +13,31 @@ litter, duplicate `gitignore`, empty `Untitled`. Remove
 `google-meridian`, `jax`, `jaxlib`, `numpyro`, `arviz`, `xarray` from
 `requirements.txt`.
 
-## Phase 1 — Close the optimization spine
+## Phase 1 — Close the optimization spine ✅
 
-Five surgical fixes:
+Five surgical fixes, all landed:
 
-1. **Start the optimization service on API boot.** Add
-   `@app.on_event("startup")` to `api/main.py`. Gate behind
+1. **Optimization service starts on API boot.** `api/main.py` has
+   `@app.on_event("startup")` / `shutdown` hooks, gated by
    `IPSA_OPTIMIZER_ENABLED=1`.
-2. **Make `_load_active_campaigns` actually populate runners.** Replace
-   hard-coded `ctr=0.03, cvr=0.08` with aggregated reads from the
-   `metrics` table; surface a loud error when zero runners are created
-   from N campaigns.
-3. **Fix the silent FK type mismatch.** `optimization_service.py:~661`
-   passes `str(arm)` to an `Integer ForeignKey('arms.id')` column; the
-   `except` at the call site swallows the type error. Resolve the string
-   to the integer arm id. **This is the linchpin — until fixed, every
-   other step is decorative.**
-4. **Trigger explanation generation on every logged change.** Add an
-   `explanation` column to `AllocationChange`; call
-   `explanation_generator.explain_allocation_change(change.id)` after
-   `log_allocation_change` returns. Use a dedicated event loop on the
-   service object — do not `asyncio.run()` per call.
-5. **Hydrate `previous_allocations` on restart** so the first cycle
-   doesn't flag every arm as "changed."
+2. **`_load_active_campaigns` populates runners from real metrics.**
+   `_aggregate_global_params` reads ctr / cvr / cpc / revenue-per-conversion
+   from the `metrics` table; falls back to documented defaults with a
+   warning when there is no history. Loud ERROR when N active campaigns
+   produce 0 runners.
+3. **Silent FK type mismatch is fixed.** New `_arm_key_to_db_id` resolves
+   `str(arm)` to the integer `Arm.id` FK in both
+   `_handle_allocation_changes` and `_save_agent_state`.
+   `ChangeTracker.log_allocation_change` now raises `TypeError` on bad
+   FKs instead of swallowing them.
+4. **Explanations generated on every logged change.** Added
+   `AllocationChange.explanation` column + migration step. The service
+   runs a dedicated `asyncio` loop in a daemon thread;
+   `_schedule_explanation(change_id)` uses `run_coroutine_threadsafe` so
+   the Anthropic client's connection pool survives across calls.
+5. **`previous_allocations` is hydrated on restart** from
+   `runner.agent.current_allocation` after `_restore_agent_state`, so the
+   first cycle doesn't flag every arm as "changed."
 
 ## Phase 2 — Wire dashboard + Ask to real data
 
