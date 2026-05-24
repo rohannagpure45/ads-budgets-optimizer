@@ -2,10 +2,9 @@
 Bandit Ads - Budget Optimization System
 
 This package provides:
-- Multi-armed bandit optimization (Thompson Sampling)
-- Contextual bandit optimization (LinUCB)
-- Marketing Mix Modeling (MMM) integration
-- Real-time API connectors for ad platforms
+- Multi-armed bandit optimization (Thompson Sampling, incrementality-aware)
+- Marketing Mix Modeling (MMM) integration via seasonality/carryover factors
+- Real-time API connectors for ad platforms (Google Ads write path active)
 - Human interpretability layer with LLM-powered explanations
 - MCP server for structured tool access
 
@@ -27,11 +26,6 @@ def get_agent():
     """Get Thompson Sampling Agent class."""
     from src.bandit_ads.agent import ThompsonSamplingAgent
     return ThompsonSamplingAgent
-
-def get_contextual_agent():
-    """Get Contextual Bandit Agent class."""
-    from src.bandit_ads.contextual_agent import ContextualBanditAgent
-    return ContextualBanditAgent
 
 def get_environment():
     """Get Ad Environment class."""

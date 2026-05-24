@@ -50,11 +50,6 @@ class ContinuousOptimizationService:
     Uses IncrementalityAwareBandit by default with Thompson Sampling and
     real-time holdout tracking. This provides production-ready optimization
     with incrementality feedback.
-
-    Bayesian integration: Meridian posteriors are periodically refreshed into
-    bandit priors via incorporate_meridian_posteriors() in _optimize_campaign().
-    See meridian_trainer.py for model training and meridian_bridge.py for the
-    posterior-to-Beta conversion.
     """
     
     def __init__(self, config_manager: Optional[ConfigManager] = None, 
@@ -507,23 +502,6 @@ class ContinuousOptimizationService:
                 opt_count = self.active_campaigns.get(campaign_id, {}).get('optimization_count', 0)
                 if opt_count % 10 == 0:
                     self._save_agent_state(runner, campaign_id)
-
-            # Refresh bandit priors from Meridian posteriors periodically (every 50 cycles)
-            if (
-                isinstance(runner.agent, IncrementalityAwareBandit)
-                and opt_count > 0
-                and opt_count % 50 == 0
-            ):
-                try:
-                    updated = runner.agent.incorporate_meridian_posteriors(
-                        campaign_id=campaign_id
-                    )
-                    if updated > 0:
-                        logger.info(
-                            f"Campaign {campaign_id}: refreshed {updated} arm priors from Meridian"
-                        )
-                except Exception as exc:
-                    logger.debug(f"Meridian prior refresh skipped: {exc}")
 
             return True
             

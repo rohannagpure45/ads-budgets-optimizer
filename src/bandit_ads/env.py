@@ -19,10 +19,6 @@ class AdEnvironment:
     - Carryover/Ad Stock: Exponential decay model with configurable decay_rate
     - Diminishing Returns: Saturation curves with configurable thresholds
     - External Factors: Holiday multipliers and economic indicators
-
-    Bayesian MMM factor estimation (learned posteriors for seasonality, carryover,
-    and saturation) is handled by the Meridian pipeline. See meridian_trainer.py
-    for model training and meridian_insights.py for posterior-derived insights.
     """
 
     def __init__(self, global_params=None, arm_specific_params=None, mmm_factors=None):
