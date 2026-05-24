@@ -626,10 +626,11 @@ def render_sidebar():
         if "current_page" not in st.session_state:
             st.session_state.current_page = "home"
 
-        # Demo entry — only shown when running on mock/sample data
+        # Demo entry — surfaced when the API is unreachable so users can
+        # still walk through the onboarding flow with seed data.
         from frontend.services.data_service import DataService as _DS
         _demo_svc = _DS()
-        if _demo_svc.use_mock:
+        if not _demo_svc.health():
             if st.button(
                 "🎬 Demo",
                 key="nav_demo",

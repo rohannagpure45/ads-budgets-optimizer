@@ -1,6 +1,6 @@
-# IPSA Status — Phase 1 (optimization spine wired)
+# IPSA Status — Phase 2 (dashboard + Ask on real data)
 
-Last updated after Phase 1 of the salvage plan. This document replaces the
+Last updated after Phase 2 of the salvage plan. This document replaces the
 eight conflicting "COMPLETE" declarations in `docs/archive/`. If anything
 in this file disagrees with code, the code is the source of truth — file
 an issue and update this doc.
@@ -11,7 +11,7 @@ an issue and update this doc.
   **`IncrementalityAwareBandit`** — covered by `tests/test_agent.py`.
 - **SQLAlchemy schema** — `Campaign`, `Arm`, `Metric`, `AgentState`,
   `APILog`, `IncrementalityExperiment`, `IncrementalityMetric`,
-  `AllocationChange` (now with an `explanation` column).
+  `AllocationChange` (with `explanation` column from Phase 1).
 - **FastAPI app boots** with 12 routers registered: `campaigns`,
   `dashboard`, `recommendations`, `optimizer`, `incrementality`, `ask`,
   `data`, `forecasting`, `scenarios`, `export`, `attribution`, `mmm`.
@@ -20,14 +20,32 @@ an issue and update this doc.
   `get_optimization_service().start()` / `.stop()`.
 - **Allocation-change logging persists real rows.** The string-vs-int FK
   mismatch in `optimization_service._handle_allocation_changes` is fixed
-  via `_arm_key_to_db_id`. `ChangeTracker.log_allocation_change` now
-  raises `TypeError` on bad FKs instead of silently dropping the row.
+  via `_arm_key_to_db_id`. `ChangeTracker.log_allocation_change` raises
+  `TypeError` on bad FKs instead of silently dropping the row.
 - **Explanations are generated on every logged change.** The optimization
   thread schedules `ExplanationGenerator.explain_allocation_change` on a
   dedicated `asyncio` event loop via `run_coroutine_threadsafe`, and the
   result is persisted onto `AllocationChange.explanation`.
-- **Streamlit dashboard** renders against the API (still relies on mock
-  fallbacks today — see "Works only in simulation").
+- **Streamlit dashboard renders against real API data only.** Phase 2
+  deleted the ~36 `_mock_*` fallbacks in `frontend/services/data_service.py`.
+  Failures raise `DataServiceUnavailable`; pages render the existing error
+  banner instead of fabricated numbers.
+- **Ask page hits `/api/ask` for real** — `_mock_query_response` is gone.
+  The page surfaces backend errors via its existing try/except rather
+  than synthesising fake answers.
+- **`GET /api/campaigns/{id}/latest_decision`** returns the most recent
+  `AllocationChange` plus its stored explanation. Plus
+  `POST /api/optimizer/{pause|resume|run}` and
+  `POST /api/campaigns/{id}/{pause|resume}` so all data-service button
+  paths have real endpoints to call.
+- **Dashboard `roas_trend` and campaign `change`** are now real
+  period-over-period deltas (channel-splits vs prior equal-length window;
+  allocation vs prior 7-day window).
+- **Recommendation impact math is real.**
+  `RecommendationEngine.generate_allocation_recommendation` reads
+  `current_allocation` from the live runner (falling back to 30-day spend
+  share) and computes `additional_spend`, `expected_revenue`, and
+  `roas_impact` against historical ROAS from the `metrics` table.
 - **Google Ads connector** `api_connectors.py` — `set_campaign_budget` /
   `mutate_campaign_budgets` are real code, not stubs. Behind
   `budget_push.enabled` (default `false`) and `budget_push.dry_run`
@@ -37,8 +55,6 @@ an issue and update this doc.
 
 ## Works only in simulation
 
-- **Dashboard / Ask page fall back to ~36 `_mock_*` methods** when the API
-  is down or returns nothing, masking real failures. Phase 2.1.
 - The **Google Ads write path is not yet invoked from
   `approve_recommendation`** — it currently only updates row status.
   Phase 3.
@@ -86,6 +102,41 @@ Now living in `src/bandit_ads/_archive/`:
 
 ## Recently changed
 
+- **Phase 2:** put the dashboard and Ask page on real data.
+  - Rewrote `frontend/services/data_service.py` from ~2,360 lines of
+    `_mock_*` branches down to a thin real-only HTTP client. New
+    `DataServiceUnavailable` exception is raised on backend failure;
+    pages render the existing error banner instead of inventing numbers.
+  - Removed every `use_mock` reference from `frontend/app.py` and
+    `frontend/pages/home.py`. The demo banner now keys off
+    `data_service.health()`.
+  - Deleted `_mock_query_response`. The Ask page already had a
+    `try/except` around `query_orchestrator`; the rewrite makes that
+    branch fire on real failures instead of synthesised answers.
+  - Added `GET /api/campaigns/{id}/latest_decision` — returns the most
+    recent `AllocationChange` row plus its stored explanation.
+  - Added `POST /api/optimizer/{pause|resume|run}` and
+    `POST /api/campaigns/{id}/{pause|resume}` so every data-service
+    button path has a corresponding endpoint (previously the data
+    service called `self.optimization_service`, an attribute that didn't
+    exist — silent crash territory).
+  - Filled the `roas_trend` TODO in
+    `api/routes/dashboard.py::get_channel_splits` with a real
+    period-over-period delta against the prior window of equal length.
+  - Filled the `change` TODO in
+    `api/routes/campaigns.py::get_campaign_allocation` with a real
+    7-day spend-share delta vs the prior 7-day window.
+  - Replaced the placeholder math in
+    `recommendations.RecommendationEngine.generate_allocation_recommendation`.
+    `current_allocation` is read from the live runner agent (falling back
+    to 30-day spend share); `additional_spend`, `expected_revenue`, and
+    `roas_impact` come from real `Metric` history. Added
+    `self.db_manager` to the engine and a `_current_allocation` helper.
+  - Drive-bys: `/api/optimizer/decisions` and
+    `/api/optimizer/explanation/{id}` were reading
+    `change.explanation_text` (never existed); both now read the real
+    `AllocationChange.explanation` column. `get_recent_decisions` also
+    respects `limit` and the no-campaign-filter case.
 - **Phase 1:** wired the optimization spine end-to-end.
   - Added `@app.on_event("startup")` / `@app.on_event("shutdown")` hooks
     in `api/main.py`, gated by `IPSA_OPTIMIZER_ENABLED=1`.

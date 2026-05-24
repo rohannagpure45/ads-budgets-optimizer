@@ -39,17 +39,39 @@ Five surgical fixes, all landed:
    `runner.agent.current_allocation` after `_restore_agent_state`, so the
    first cycle doesn't flag every arm as "changed."
 
-## Phase 2 — Wire dashboard + Ask to real data
+## Phase 2 — Wire dashboard + Ask to real data ✅
 
-1. Delete ~36 `_mock_*` methods in `frontend/services/data_service.py`;
-   raise a clear `DataServiceUnavailable` instead of silently lying.
-2. Make the Ask page hit `/api/ask` for real and stop falling back to
-   `_mock_query_response`.
-3. Add `GET /api/campaigns/{id}/latest_decision`.
-4. Fill TODO stubs: `dashboard.roas_trend`, `campaigns.change` 7-day
-   delta.
-5. Replace placeholder math in `recommendations.py` (current allocation,
-   additional spend, expected revenue, ROAS impact) with real reads.
+All five sub-tasks landed:
+
+1. **Mock fallback deleted.** `frontend/services/data_service.py` was
+   rewritten from ~2,360 lines of `_mock_*` branches down to a thin
+   real-only client. Failures raise `DataServiceUnavailable`; pages
+   render the existing error banner instead of inventing numbers. The
+   `use_mock` flag is gone; `frontend/app.py` and `frontend/pages/home.py`
+   key the demo banner off `data_service.health()` instead.
+2. **Ask page calls `/api/ask` for real.** `_mock_query_response` is
+   gone. `query_orchestrator` raises on backend error so
+   `frontend/pages/ask.py`'s existing `try/except` shows the error
+   instead of fake answers.
+3. **`GET /api/campaigns/{id}/latest_decision`** added — returns the
+   most recent `AllocationChange` row plus its stored explanation.
+4. **`dashboard.roas_trend` and `campaigns.change`** are real.
+   `channel-splits` computes period-over-period ROAS delta against the
+   prior window of equal length; `/campaigns/{id}/allocation` computes
+   7-day spend-share delta vs. the prior 7-day window.
+5. **`recommendations.generate_allocation_recommendation`** now reads
+   `current_allocation` from the live runner agent (falling back to the
+   30-day spend share) and computes `additional_spend`,
+   `expected_revenue`, and `roas_impact` from real `Metric` history.
+
+Drive-bys done while we were in the area:
+- Fixed `/api/optimizer/decisions` and `/api/optimizer/explanation/{id}`
+  to read the real `AllocationChange.explanation` column (Phase 1's new
+  column) instead of the non-existent `explanation_text`. The decisions
+  route also now respects `limit` and the no-campaign-filter case.
+- Added `POST /api/optimizer/pause|resume|run` and
+  `POST /api/campaigns/{id}/pause|resume` so the data service's button
+  paths actually have endpoints to call.
 
 ## Phase 3 — Google Ads write path
 

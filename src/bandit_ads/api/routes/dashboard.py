@@ -168,7 +168,7 @@ async def get_channel_splits(
             else:
                 start_date = datetime(end_date.year, end_date.month, 1)
             
-            # Get metrics grouped by channel
+            # Get metrics grouped by channel for the current window
             from src.bandit_ads.database import Arm
             metrics = session.query(
                 Arm.channel,
@@ -183,17 +183,36 @@ async def get_channel_splits(
                     Metric.timestamp <= end_date
                 )
             ).group_by(Arm.channel).all()
-            
-            # Calculate total for allocation percentages
+
+            # Prior window of equal length for trend comparison
+            window_len = end_date - start_date
+            prev_start = start_date - window_len
+            prev_end = start_date
+
+            prev_metrics = dict(
+                (channel, (spent or 0.0, revenue or 0.0))
+                for channel, spent, revenue in session.query(
+                    Arm.channel,
+                    func.sum(Metric.cost),
+                    func.sum(Metric.revenue),
+                ).join(
+                    Metric, Arm.id == Metric.arm_id
+                ).filter(
+                    and_(
+                        Metric.timestamp >= prev_start,
+                        Metric.timestamp < prev_end,
+                    )
+                ).group_by(Arm.channel).all()
+            )
+
             total_spent = sum(row.spent for row in metrics)
-            
-            # Map channels to display info
+
             channel_info = {
                 "Search": {"id": "search", "name": "Search (Google/Bing)", "icon": "🔍", "color": "#22C55E"},
                 "Display": {"id": "programmatic", "name": "Programmatic (TTD)", "icon": "🎯", "color": "#6366F1"},
                 "Social": {"id": "social", "name": "Social (Meta)", "icon": "👥", "color": "#3B82F6"},
             }
-            
+
             result = []
             for row in metrics:
                 channel = row.channel
@@ -203,23 +222,29 @@ async def get_channel_splits(
                     "icon": "📊",
                     "color": "#737373"
                 })
-                
+
                 roas = row.revenue / row.spent if row.spent > 0 else 0.0
                 allocation_percent = (row.spent / total_spent) if total_spent > 0 else 0.0
-                
+
+                prev_spent, prev_revenue = prev_metrics.get(channel, (0.0, 0.0))
+                prev_roas = (prev_revenue / prev_spent) if prev_spent > 0 else 0.0
+                roas_trend = (
+                    ((roas - prev_roas) / prev_roas * 100) if prev_roas > 0 else 0.0
+                )
+
                 result.append({
                     "id": info["id"],
                     "name": info["name"],
                     "icon": info["icon"],
                     "color": info["color"],
-                    "budget": row.spent,  # Using spent as budget for now
+                    "budget": row.spent,
                     "spent": row.spent,
                     "allocation_percent": allocation_percent,
                     "campaign_count": row.campaign_count,
                     "roas": roas,
-                    "roas_trend": 0.0  # TODO: Calculate trend
+                    "roas_trend": round(roas_trend, 2),
                 })
-            
+
             return result
     except Exception as e:
         logger.error(f"Error getting channel splits: {str(e)}")
